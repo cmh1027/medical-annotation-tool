@@ -22,6 +22,20 @@ import nibabel as nib
 import pydicom
 from glob import glob
 import cv2
+
+annotation_palette = [
+    (0, 0, 0), # dummy
+    (228, 26, 28),    # Red
+    (55, 126, 184),   # Blue
+    (77, 175, 74),    # Green
+    (255, 127, 0),    # Orange
+    (152, 78, 163),   # Purple
+    (166, 86, 40),    # Brown
+    (255, 0, 144),    # Pink
+    (0, 206, 209),    # Cyan
+    (255, 255, 51),   # Yellow
+]
+
 def read_dicom(dcm_path, rescale=False):
     dcm = pydicom.dcmread(dcm_path,force=True)
     if not hasattr(dcm.file_meta,'TransferSyntaxUID'):
@@ -223,11 +237,12 @@ class ImageLabel(QLabel):
             painter.setRenderHint(QPainter.Antialiasing)
 
             # Semi-transparent red circle
-            brush = QColor(255, 0, 0, 100)  # RGBA
+            r, g, b = annotation_palette[self.parent.annotation_number]
+            brush = QColor(r, g, b, 100)  # RGBA
             painter.setBrush(brush)
             painter.setPen(Qt.NoPen)
 
-            radius = self.parent.brush_size
+            radius = int(self.parent.brush_size * self.scale_factor)
             x = self.cursor_pos.x() - radius
             y = self.cursor_pos.y() - radius
             painter.drawEllipse(x, y, 2 * radius, 2 * radius)
@@ -270,6 +285,8 @@ class DICOMViewer(QMainWindow):
         self.annotation_visible = True
         self.title = "DICOM Annotation tool"
         self.last_dirname = os.getcwd()
+        self.last_basename = os.getcwd()
+        self.annotation_number = 1
         self.initialize()
         self.refresh()
 
@@ -362,6 +379,16 @@ class DICOMViewer(QMainWindow):
         self.brush_size = self.size_slider.value()
         controls_layout.addWidget(self.size_label)
         controls_layout.addWidget(self.size_slider)
+
+        self.color_slider = QSlider(Qt.Horizontal)
+        self.color_slider.setMinimum(1)
+        self.color_slider.setMaximum(9)
+        self.tolerance_slider.setValue(self.annotation_number)
+        self.color_slider.valueChanged.connect(self.update_annotation_number)
+        self.color_label = QLabel(f"Color ■")
+        self.color_label.setStyleSheet(f"color: rgb{annotation_palette[self.annotation_number]};")  # Light blue
+        controls_layout.addWidget(self.color_label)
+        controls_layout.addWidget(self.color_slider)
 
         # Annotation Mode Button
         self.annotation_mode_button = QPushButton("-")
@@ -476,6 +503,7 @@ class DICOMViewer(QMainWindow):
                     if len(nii_list) > 0:
                         self.load_annotation(path=nii_list[0])
                 self.last_dirname = os.path.dirname(folder)
+                self.last_basename = folder
         except Exception as e:
             print("Failed to load file")
            
@@ -515,6 +543,10 @@ class DICOMViewer(QMainWindow):
     def update_size_label(self, value):
         self.size_label.setText(f"RoI Size: {value}")
         self.brush_size = value
+
+    def update_annotation_number(self, value):
+        self.annotation_number = value
+        self.color_label.setStyleSheet(f"color: rgb{annotation_palette[self.annotation_number]};")  # Light blue
 
     def update_intensity_range(self, value):
         low, high = value
@@ -588,6 +620,7 @@ class DICOMViewer(QMainWindow):
             self.intensity_slider.setVisible(True)
             self.tolerance_label.setVisible(False)
             self.tolerance_slider.setVisible(False)
+
         elif self.brush_mode == 'Range':
             self.brush_mode = 'Auto'
             self.brush_mode_button.setText('Auto')
@@ -614,10 +647,13 @@ class DICOMViewer(QMainWindow):
 
         if self.annotation_visible:
             ann = self.annotation_map[self.slice_index]
-            red_overlay = np.zeros_like(rgb)
-            red_overlay[..., 0] = 255  # Red channel
-            mask = ann == 1
-            rgb[mask] = (1 - alpha) * rgb[mask] + alpha * red_overlay[mask]
+            for k in np.unique(ann):
+                if k == 0: continue
+                overlay = np.zeros_like(rgb)
+                for channel in [0, 1, 2]:
+                    overlay[..., channel] = annotation_palette[k][channel]  # Red channel
+                mask = (ann == k)
+                rgb[mask] = (1 - alpha) * rgb[mask] + alpha * overlay[mask]
 
         # Convert to uint8 for QImage
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
@@ -670,7 +706,7 @@ class DICOMViewer(QMainWindow):
         circular_mask = dist_sq <= R**2
 
         # Intensity threshold mask
-        intensity_mask = (roi > self.intensity_min) & (roi < self.intensity_max)
+        intensity_mask = (roi >= self.intensity_min) & (roi <= self.intensity_max)
 
         # Final mask: inside circle and within intensity range
         mask = circular_mask & intensity_mask
@@ -683,7 +719,7 @@ class DICOMViewer(QMainWindow):
             global_x = x_min + dx_
             old_val = self.annotation_map[z, global_y, global_x]
             undo_entry.append((z, global_y, global_x, old_val))
-            self.annotation_map[z, global_y, global_x] = 1
+            self.annotation_map[z, global_y, global_x] = self.annotation_number
 
         self.annotation_history.append(undo_entry)
         self.update_slice(z)
@@ -811,7 +847,7 @@ class DICOMViewer(QMainWindow):
                 global_x = x_min + dx_
                 old_val = self.annotation_map[global_z, global_y, global_x]
                 undo_entry.append((global_z, global_y, global_x, old_val))
-                self.annotation_map[global_z, global_y, global_x] = 1
+                self.annotation_map[global_z, global_y, global_x] = self.annotation_number
 
         self.annotation_history.append(undo_entry)
         self.update_slice(z)
@@ -828,7 +864,6 @@ class DICOMViewer(QMainWindow):
 
         # Extract ROIs
         ann_slice = self.annotation_map[z, y_min:y_max, x_min:x_max]
-        img_slice = self.volume[z, y_min:y_max, x_min:x_max]
 
         # Compute circular mask
         H, W = ann_slice.shape
@@ -837,7 +872,7 @@ class DICOMViewer(QMainWindow):
         dist_sq = (Y - center_y)**2 + (X - center_x)**2
         circular_mask = dist_sq <= R**2
 
-        mask = ((ann_slice != 0) & circular_mask)
+        mask = ((ann_slice == self.annotation_number) & circular_mask)
 
         # Save undo info and clear annotations
         undo_entry = []
@@ -890,7 +925,7 @@ class DICOMViewer(QMainWindow):
         # Only those in the connected component AND in slices in [z_min, z_max)
         mask_remove = np.zeros_like(ann_map, dtype=bool)
         for slice_idx in range(z_min, z_max):
-            mask_slice = (labeled[slice_idx] == comp_label)
+            mask_slice = (labeled[slice_idx] == comp_label) & (self.annotation_map == self.annotation_number)
             mask_remove[slice_idx] = mask_slice
 
         # Save old annotation values for undo
@@ -919,12 +954,12 @@ class DICOMViewer(QMainWindow):
         if self.flip_idx:
             anno = np.flip(anno, 0)
         if self.file_mode == "dicom":
-            save_path = QFileDialog.getSaveFileName(self, caption="Save Annotation", filter="Nifti file (*.nii)", directory="annotation.nii")[0]
+            save_path = QFileDialog.getSaveFileName(self, caption="Save Annotation", filter="Nifti file (*.nii)", directory=os.path.join(self.last_basename, "annotation.nii"))[0]
             if save_path:
                 nib.save(nib.Nifti1Image(np.transpose(anno, (1,2,0)), np.ones((4,4))), save_path)
                 self.last_saved_name = save_path
         elif self.file_mode == "numpy":
-            save_path = QFileDialog.getSaveFileName(self, caption="Save Annotation", filter="Numpy file (*.npy)", directory="label.npy")[0]
+            save_path = QFileDialog.getSaveFileName(self, caption="Save Annotation", filter="Numpy file (*.npy)", directory=os.path.join(self.last_basename, "label.npy"))[0]
             if save_path:
                 np.save(save_path, np.transpose(anno, (1,2,0)))
                 self.last_saved_name = save_path
@@ -944,7 +979,8 @@ class DICOMViewer(QMainWindow):
                 np.save(self.last_saved_name, np.transpose(anno, (1,2,0)))
             else:
                 raise NotImplementedError
-        print(f"{self.last_saved_name} Save complete")
+        if self.last_saved_name:
+            print(f"{self.last_saved_name} Save complete")
 
 def main():
     app = QApplication(sys.argv)
