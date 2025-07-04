@@ -8,9 +8,9 @@ from PyQt5.QtWidgets import (
     QPushButton, QHBoxLayout, QFileDialog, QScrollArea,
     QLineEdit, QFormLayout, QMainWindow, QAction
 )
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QPixmap, QImage, QWheelEvent, QPainter, QColor
-from PyQt5.QtWidgets import QShortcut, QSizePolicy
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal
+from PyQt5.QtGui import QPixmap, QImage, QWheelEvent, QPainter, QColor, QPen, QIcon, QFont
+from PyQt5.QtWidgets import QShortcut, QTextEdit, QTreeView, QFileSystemModel, QSplitter, QSizePolicy, QMenu, QAction
 from PyQt5.QtGui import QKeySequence
 from qtrangeslider import QRangeSlider
 from scipy.ndimage import label
@@ -22,7 +22,7 @@ import nibabel as nib
 import pydicom
 from glob import glob
 import cv2
-
+from skimage.measure import regionprops
 annotation_palette = [
     (0, 0, 0), # dummy
     (228, 26, 28),    # Red
@@ -35,6 +35,88 @@ annotation_palette = [
     (0, 206, 209),    # Cyan
     (255, 255, 51),   # Yellow
 ]
+
+normalFont = QFont()
+boldFont = QFont()
+boldFont.setBold(True)  
+
+class QToggleButton(QPushButton):
+    clicked_after_bold = pyqtSignal()
+    def __init__(self, text="", parent=None, toggle_group=None):
+        super().__init__(text, parent)
+        self._bold = False  # initial state
+        self.clicked.connect(self.toggle_bold)
+        self.toggle_group = None
+        if toggle_group is not None:
+            toggle_group.append(self)
+            self.toggle_group = toggle_group
+
+    def toggle_bold(self):
+        self._bold = not self._bold
+        if self.toggle_group is not None:
+            for button in self.toggle_group:
+                button.setFont(normalFont)
+        if self._bold:
+            self.setFont(boldFont)
+        else:
+            self.setFont(normalFont)
+        self.clicked_after_bold.emit()
+
+class QToggleButtonGroup(list):
+    pass
+
+
+def keep_largest_component(mask, mode, num_components=1, direction=None):
+    assert len(mask.shape) == 3
+    if mode == "None":
+        return mask
+    elif mode == "3D":
+        labeled, _ = label(mask)
+        props = regionprops(labeled)
+        props_sorted = sorted(props, key=lambda x: x.area, reverse=True)
+        output = np.zeros_like(mask)
+        for i in range(min(num_components, len(props_sorted))):
+            output[labeled == props_sorted[i].label] = 1
+        return output.astype(mask.dtype)
+    elif mode == "2D":
+        assert direction is not None
+        output = np.zeros_like(mask)
+        positive_slices = np.unique(np.argwhere(mask)[..., 0])
+        if direction == 'all':
+            z_mid = mask.shape[0] // 2
+            mask_left = mask.copy()
+            mask_right = mask.copy()
+            mask_left[z_mid:] = 0
+            mask_right[:z_mid] = 0
+            output_left = keep_largest_component(mask_left, mode, direction='left')
+            output_right = keep_largest_component(mask_right, mode, direction='right')
+            output = np.logical_or(output_left, output_right)
+        else:
+            if direction == 'left':
+                positive_slices = positive_slices[::-1]
+            last_slice = np.ones_like(mask[0])
+            for s in positive_slices:
+                if mask[s].sum() == 0:
+                    break
+                if (last_slice * mask[s]).sum() == 0:
+                    break
+                labeled, _ = label(mask[s])
+                for k in np.unique(labeled):
+                    if k == 0: continue
+                    if ((labeled == k) * last_slice).sum() == 0:
+                        labeled[labeled == k] = 0
+                labeled, _ = label(labeled > 0)
+                props = regionprops(labeled)
+                props_sorted = sorted(props, key=lambda x: x.area, reverse=True)
+                output_slice = np.zeros_like(mask[s])
+                for i in range(min(num_components, len(props_sorted))):
+                    output_slice[labeled == props_sorted[i].label] = 1
+                output[s] = output_slice
+                last_slice = output_slice
+        return output.astype(mask.dtype)
+    else:
+        print("Keep_largest_component : Invalid mode", mode)
+        return mask
 
 def read_dicom(dcm_path, rescale=False):
     dcm = pydicom.dcmread(dcm_path,force=True)
@@ -146,15 +228,21 @@ class ImageLabel(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.scale_factor = 1.0
         self.original_pixmap = None
-        self.cursor_pos = (0,0)
+        self.cursor_pos = None
         self.parent = parent
         self.left_dragging = False
         self.right_dragging = False
-        self.last_drag_pos = None
+        self.left_clicked = False
+        self.last_cursor_pos = None
 
     def setPixmap(self, pixmap: QPixmap):
         self.original_pixmap = pixmap
         self.update_scaled_pixmap()
+
+    def isMouseInsidePixmap(self, event=None, x=None, y=None):
+        if event is not None:
+            x, y = self.get_image_coordinates(event)
+        return 0 <= x < self.original_pixmap.width() and 0 <= y < self.original_pixmap.height()
 
     def update_scaled_pixmap(self):
         if self.original_pixmap:
@@ -190,70 +278,119 @@ class ImageLabel(QLabel):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.left_dragging = True
+            self.right_dragging = False
             x, y = self.get_image_coordinates(event)
-            mode = self.parent.annotation_mode
-            if 0 <= x < self.original_pixmap.width() and 0 <= y < self.original_pixmap.height():
-                if self.parent.brush_mode == 'Auto':
-                    if event.modifiers() & Qt.AltModifier:
-                        self.parent.remove_annotation_auto(y, x, mode)
-                    else:
-                        self.parent.annotate_pixel_auto(y, x, mode)
-                else:
-                    if event.modifiers() & Qt.AltModifier:
-                        self.parent.remove_annotation_range(y, x)
-                    else:
-                        self.parent.annotate_pixel_range(y, x)
-                        
+            if self.parent.probe_mode:
+                self.parent.set_volume_intensity(y, x)
+                self.parent.probe_mode = False
+            else:
+                mode = self.parent.annotation_mode
+                if self.isMouseInsidePixmap(x=x, y=y):
+                    if self.parent.brush_mode == 'Auto':
+                        if event.modifiers() & Qt.AltModifier:
+                            self.parent.remove_annotation_auto(y, x, mode)
+                        else:
+                            self.parent.annotate_pixel_auto(y, x, mode)
+                    elif self.parent.brush_mode == 'Range':
+                        if event.modifiers() & Qt.AltModifier:
+                            self.parent.remove_annotation_range(y, x)
+                        else:
+                            self.parent.annotate_pixel_range(y, x, mode)
+                        self.left_dragging = True
+                    elif self.parent.brush_mode == 'Change':
+                        self.parent.annotate_pixel_change(y, x)
+                    elif self.parent.brush_mode == 'Line':
+                        if self.left_clicked:
+                            src = self.get_image_coordinates(self.last_cursor_pos)
+                            dst = self.get_image_coordinates(event.pos())
+                            self.parent.annotate_pixel_line(src, dst, mode)
+                            self.left_clicked = False
+                            self.cursor_pos = None
+                            self.update()
+                        else:
+                            self.left_clicked = True
         elif event.button() == Qt.RightButton:
+            self.left_clicked = False
+            self.left_dragging = False
             self.right_dragging = True
-            self.last_drag_pos = event.pos()
+        self.last_cursor_pos = event.pos()
 
     def mouseMoveEvent(self, event):
-        if self.parent.brush_mode == "Range":
-            self.cursor_pos = event.pos()
-            self.update()
-            if self.left_dragging:
-                x, y = self.get_image_coordinates(event)
-                if 0 <= x < self.original_pixmap.width() and 0 <= y < self.original_pixmap.height():
-                    if event.modifiers() & Qt.AltModifier:
-                        self.parent.remove_annotation_range(y, x)
-                    else:
-                        self.parent.annotate_pixel_range(y, x)
+        x, y = self.get_image_coordinates(event)
+        if self.isMouseInsidePixmap(x=x, y=y):
+            if self.parent.brush_mode == "Range":
+                self.cursor_pos = event.pos()
+                self.update()
+                if self.left_dragging:
+                    mode = self.parent.annotation_mode
+                    if self.isMouseInsidePixmap(x=x, y=y):
+                        if event.modifiers() & Qt.AltModifier:
+                            self.parent.remove_annotation_range(y, x)
+                        else:
+                            self.parent.annotate_pixel_range(y, x, mode, drag=True)
+            elif self.parent.brush_mode == "Line":
+                if self.left_clicked:
+                    self.cursor_pos = event.pos()
+                    self.update()
+            
+            elif self.parent.brush_mode == "Auto":
+                self.cursor_pos = event.pos()
+                self.update()
 
-        if self.right_dragging:
-            if self.last_drag_pos:
-                delta = event.pos() - self.last_drag_pos
-                self.last_drag_pos = event.pos()
-                h_bar = self.parent.image_area.horizontalScrollBar()
-                v_bar = self.parent.image_area.verticalScrollBar()
-                h_bar.setValue(h_bar.value() - delta.x())
-                v_bar.setValue(v_bar.value() - delta.y())
+            if self.right_dragging:
+                if self.last_cursor_pos:
+                    delta = event.pos() - self.last_cursor_pos
+                    self.last_cursor_pos = event.pos()
+                    h_bar = self.parent.image_area.horizontalScrollBar()
+                    v_bar = self.parent.image_area.verticalScrollBar()
+                    h_bar.setValue(h_bar.value() - delta.x())
+                    v_bar.setValue(v_bar.value() - delta.y())
+        else:
+            self.left_dragging = False
+            self.right_dragging = False
+            self.left_clicked = False
+            self.cursor_pos = None
+            self.last_cursor_pos = None
+            self.update()
+
 
     def paintEvent(self, event):
         super().paintEvent(event)  # Draw image normally
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        r, g, b = annotation_palette[self.parent.annotation_number]
         if self.parent.brush_mode == "Range" and self.cursor_pos:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
-
-            # Semi-transparent red circle
-            r, g, b = annotation_palette[self.parent.annotation_number]
-            brush = QColor(r, g, b, 100)  # RGBA
-            painter.setBrush(brush)
+            color = QColor(r, g, b, 100)
+            painter.setBrush(color)
             painter.setPen(Qt.NoPen)
-
             radius = int(self.parent.brush_size * self.scale_factor)
             x = self.cursor_pos.x() - radius
             y = self.cursor_pos.y() - radius
             painter.drawEllipse(x, y, 2 * radius, 2 * radius)
-            painter.end()
-
+        elif self.parent.brush_mode == "Line" and self.cursor_pos:
+            color = QColor(r, g, b, 100)
+            pen = QPen(color)
+            pen.setWidth(int(self.parent.brush_size * self.scale_factor))  # Set thickness
+            painter.setPen(pen)
+            start = self.last_cursor_pos
+            end = self.cursor_pos
+            painter.drawLine(start, end)
+        elif self.parent.brush_mode == "Auto" and self.cursor_pos:
+            color = QColor(r, g, b, 30)
+            painter.setBrush(color)
+            painter.setPen(Qt.NoPen)
+            radius = int(self.parent.brush_size * self.scale_factor)
+            x = self.cursor_pos.x() - radius
+            y = self.cursor_pos.y() - radius
+            painter.drawEllipse(x, y, 2 * radius, 2 * radius)
+        painter.end()
+        
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.left_dragging = False
         elif event.button() == Qt.RightButton:
             self.right_dragging = False
-            self.last_drag_pos = None
+            self.last_cursor_pos = None
 
     def get_image_coordinates(self, event):
         # Calculate click position relative to image coordinates
@@ -272,21 +409,26 @@ class ImageLabel(QLabel):
 class DICOMViewer(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(QIcon("jlk_logo.png"))  # Set your logo here
         self.volume = np.random.randint(low=0, high=1000, size=(20, 200, 200), dtype=np.int16)
+        self.volume_inverse = None
+        self.volume_isInverse = False
         self.annotation_map = np.zeros_like(self.volume, dtype=np.uint8)
         self.tolerance = 0.15
         self.annotation_mode = '-'
         self.brush_mode = 'Auto'
         self.window_center = 3000
         self.window_width = 3000
-        self.intensity_min = 100
+        self.intensity_min = 0
         self.intensity_max = 300
+        self.probe_mode = False
         self.flip_idx = False
         self.annotation_visible = True
         self.title = "DICOM Annotation tool"
         self.last_dirname = os.getcwd()
         self.last_basename = os.getcwd()
         self.annotation_number = 1
+        self.keep_largest_mode = "None"
         self.initialize()
         self.refresh()
 
@@ -360,7 +502,7 @@ class DICOMViewer(QMainWindow):
         self.intensity_slider = QRangeSlider()
         self.intensity_slider.setOrientation(Qt.Horizontal)
         self.intensity_slider.setMinimum(0)
-        self.intensity_slider.setMaximum(2000)
+        self.intensity_slider.setMaximum(3000)
         self.intensity_slider.setValue((self.intensity_min, self.intensity_max))  # Set initial lower and upper bounds
         self.intensity_slider.valueChanged.connect(self.update_intensity_range)
         self.intensity_slider.setTracking(True)
@@ -374,41 +516,92 @@ class DICOMViewer(QMainWindow):
         self.size_slider.setMinimum(1)
         self.size_slider.setMaximum(50)
         self.size_slider.setValue(10)
-        self.size_slider.valueChanged.connect(self.update_size_label)
+        self.size_slider.valueChanged.connect(self.update_roi_size)
         self.size_label = QLabel(f"RoI Size: {self.size_slider.value()}")
         self.brush_size = self.size_slider.value()
         controls_layout.addWidget(self.size_label)
         controls_layout.addWidget(self.size_slider)
 
+        self.propagate_slider = QSlider(Qt.Horizontal)
+        self.propagate_slider.setMinimum(0)
+        self.propagate_slider.setMaximum(50)
+        self.propagate_slider.setValue(0)
+        self.propagate_slider.valueChanged.connect(self.update_propagate_slides)
+        self.propagate_label = QLabel(f"Propagating slides: {self.propagate_slider.value()}")
+        self.propagete_slides = self.propagate_slider.value()
+        controls_layout.addWidget(self.propagate_label)
+        controls_layout.addWidget(self.propagate_slider)
+
         self.color_slider = QSlider(Qt.Horizontal)
         self.color_slider.setMinimum(1)
         self.color_slider.setMaximum(9)
-        self.tolerance_slider.setValue(self.annotation_number)
+        self.color_slider.setValue(self.annotation_number)
         self.color_slider.valueChanged.connect(self.update_annotation_number)
         self.color_label = QLabel(f"Color ■")
         self.color_label.setStyleSheet(f"color: rgb{annotation_palette[self.annotation_number]};")  # Light blue
         controls_layout.addWidget(self.color_label)
         controls_layout.addWidget(self.color_slider)
+        for i in range(1, 10):  # keys 1~9
+            shortcut = QShortcut(QKeySequence(f"F{i}"), self)
+            shortcut.activated.connect(lambda i=i: self.update_annotation_number(i))  # capture i correctly
 
         # Annotation Mode Button
+        annotation_mode_layout = QHBoxLayout()
+        annotation_mode_layout.setAlignment(Qt.AlignLeft)
         self.annotation_mode_button = QPushButton("-")
         self.annotation_mode_button.clicked.connect(self.toggle_annotation_mode)
         self.annotation_mode_button.setShortcut("Tab")
-        self.brush_mode_button = QPushButton("Auto")
-        self.brush_mode_button.clicked.connect(self.toggle_brush_mode)
-        mode_layout = QHBoxLayout()
-        mode_layout.setAlignment(Qt.AlignLeft)
-        mode_layout.addWidget(QLabel("Mode"))
-        mode_layout.addWidget(self.annotation_mode_button)
-        mode_layout.addWidget(QLabel("Brush"))
-        mode_layout.addWidget(self.brush_mode_button)
-        controls_layout.addLayout(mode_layout)
+        annotation_mode_layout.addWidget(QLabel("Mode"))
+        annotation_mode_layout.addWidget(self.annotation_mode_button)
+        controls_layout.addLayout(annotation_mode_layout)
 
-        # Wrap controls in a QWidget
+        brush_mode_layout = QHBoxLayout()
+        brush_mode_layout.setAlignment(Qt.AlignLeft)
+        brush_mode_layout.addWidget(QLabel("Brush"))
+        brush_button_group = QToggleButtonGroup()
+        self.brush_button_auto = QToggleButton("Auto", toggle_group=brush_button_group)
+        self.brush_button_auto.setFont(boldFont)
+        self.brush_button_auto.clicked.connect(lambda _: self.toggle_brush_mode("Auto"))
+        brush_mode_layout.addWidget(self.brush_button_auto)
+        self.brush_button_range = QToggleButton("Range", toggle_group=brush_button_group)
+        self.brush_button_range.clicked.connect(lambda _: self.toggle_brush_mode("Range"))
+        brush_mode_layout.addWidget(self.brush_button_range)
+        self.brush_button_change = QToggleButton("Change", toggle_group=brush_button_group)
+        self.brush_button_change.clicked.connect(lambda _: self.toggle_brush_mode("Change"))
+        brush_mode_layout.addWidget(self.brush_button_change)
+        self.brush_button_line = QToggleButton("Line", toggle_group=brush_button_group)
+        self.brush_button_line.clicked.connect(lambda _: self.toggle_brush_mode("Line"))
+        brush_mode_layout.addWidget(self.brush_button_line)
+        controls_layout.addLayout(brush_mode_layout)
+
+        keep_largest_layout = QHBoxLayout()
+        keep_largest_layout.setAlignment(Qt.AlignLeft)
+        self.keep_largest_button = QPushButton("None")
+        self.keep_largest_button.clicked.connect(self.toggle_keep_largest)
+        self.keep_largest_label = QLabel("Keep Largest")
+        keep_largest_layout.addWidget(self.keep_largest_label)
+        keep_largest_layout.addWidget(self.keep_largest_button)
+        self.keep_largest_label.setVisible(False)
+        self.keep_largest_button.setVisible(False)
+        controls_layout.addLayout(keep_largest_layout)
+
+        misc_layout = QHBoxLayout()
+        misc_layout.setAlignment(Qt.AlignLeft)
+        self.probe_button = QPushButton("Probe")
+        self.probe_button.clicked.connect(self.enable_probe)
+        misc_layout.addWidget(self.probe_button)
+        self.inverse_button = QToggleButton("Inverse")
+        self.inverse_button.clicked.connect(self.inverse_intensity)
+        misc_layout.addWidget(self.inverse_button)
+        controls_layout.addLayout(misc_layout)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        controls_layout.addWidget(self.log_box)
+
         controls_widget = QWidget()
         controls_widget.setLayout(controls_layout)
 
-        # === Right: Image view ===
         self.image_label = ImageLabel(self)
         self.image_label.setMouseTracking(True)
         self.image_area = QScrollArea()
@@ -416,11 +609,34 @@ class DICOMViewer(QMainWindow):
         self.image_area.setWidget(self.image_label)
         self.image_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.image_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        
+        self.image_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.image_area.setMinimumWidth(500)
 
-        # === Add to main layout ===
-        main_layout.addWidget(controls_widget, stretch=1)
-        main_layout.addWidget(self.image_area, stretch=4)  # Let image view expand
+        self.file_model = QFileSystemModel()
+        self.file_model.setRootPath(os.getcwd())  # or set to a specific path
+
+        self.navigator = QTreeView()
+        self.navigator.setModel(self.file_model)
+        self.navigator.setRootIndex(self.file_model.index(os.getcwd()))
+        self.navigator.setColumnHidden(1, True)  # Hide Size
+        self.navigator.setColumnHidden(2, True)  # Hide Type
+        self.navigator.setColumnHidden(3, True)  # Hide Date Modified
+        self.navigator.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.navigator.customContextMenuRequested.connect(self.navigator_menu)
+        self.navigator.setMinimumWidth(170)
+        # Create a horizontal splitter
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Add widgets to splitter
+        splitter.addWidget(self.navigator)
+        splitter.addWidget(controls_widget)
+        splitter.addWidget(self.image_area)
+        splitter.setSizes([1, 5, 5])  # works like stretch
+
+
+        main_layout.addWidget(splitter)
+
+
         # Keyboard shortcuts
         QShortcut(QKeySequence("1"), self).activated.connect(self.decrease_tolerance)
         QShortcut(QKeySequence("2"), self).activated.connect(self.increase_tolerance)
@@ -435,6 +651,29 @@ class DICOMViewer(QMainWindow):
         # Menu bar setup
         self.create_menu()
         self.file_mode = "dicom"
+
+
+    def navigator_menu(self, point):
+        index = self.navigator.indexAt(point)
+
+        if not index.isValid():
+            return
+        
+        if self.file_model.isDir(index):
+            menu = QMenu()
+            open_action = QAction("Open", self.navigator)
+    
+            def open_folder():
+                folder = self.file_model.filePath(index)
+                self.open(folder=folder)
+            
+            open_action.triggered.connect(open_folder)
+            menu.addAction(open_action)
+            menu.exec_(self.navigator.viewport().mapToGlobal(point))
+        
+
+    def logging(self, text):
+        self.log_box.append("- " + text)
 
     def create_menu(self):
         menubar = self.menuBar()
@@ -466,10 +705,11 @@ class DICOMViewer(QMainWindow):
         file_menu.addAction(save_action)
         file_menu.addAction(save_action_new)
 
-    def open(self):
-        folder = QFileDialog.getExistingDirectory(
-            None, "Select DICOM Series Folder", self.last_dirname
-        )
+    def open(self, folder=None):
+        if folder is None:
+            folder = QFileDialog.getExistingDirectory(
+                None, "Select DICOM Series Folder", self.last_dirname
+            )
         self.dicom_folder = folder
         try:
             if folder:
@@ -504,10 +744,29 @@ class DICOMViewer(QMainWindow):
                         self.load_annotation(path=nii_list[0])
                 self.last_dirname = os.path.dirname(folder)
                 self.last_basename = folder
+                self.intensity_slider.setMaximum(self.volume.max())
+                self.volume_inverse = None
+            self.logging(f"Open Series : {folder}")
         except Exception as e:
-            print("Failed to load file")
-           
-            
+            self.logging("Failed to load file", e)
+
+    def inverse_intensity(self):
+        M = self.volume.max()
+        if self.volume_inverse is None:
+            self.volume_inverse = M - self.volume
+        self.volume, self.volume_inverse = self.volume_inverse, self.volume
+        self.window_center = M - self.window_center
+        self.center_slider.setValue(self.window_center)
+        self.update_slice(self.slice_index)
+        self.volume_isInverse = not self.volume_isInverse
+        if self.volume_isInverse:
+            self.inverse_button.setFont(boldFont)
+        else:
+            self.inverse_button.setFont(normalFont)
+
+    def enable_probe(self):
+        self.probe_mode = True
+
     def update_tolerance_from_slider(self, value):
         self.tolerance = value / 100.0
         self.tolerance_label.setText(f"Tolerance: {(self.tolerance):.2f}")
@@ -530,7 +789,7 @@ class DICOMViewer(QMainWindow):
             self.size_slider.setValue(current - 1)
         size = self.size_slider.value()
         self.brush_size = size
-        self.update_size_label(size)
+        self.update_roi_size(size)
 
     def increase_brush(self):
         current = self.size_slider.value()
@@ -538,15 +797,20 @@ class DICOMViewer(QMainWindow):
             self.size_slider.setValue(current + 1)
         size = self.size_slider.value()
         self.brush_size = size
-        self.update_size_label(size)
+        self.update_roi_size(size)
 
-    def update_size_label(self, value):
+    def update_roi_size(self, value):
         self.size_label.setText(f"RoI Size: {value}")
         self.brush_size = value
+
+    def update_propagate_slides(self, value):
+        self.propagate_label.setText(f"Propagating slides: {value}")
+        self.propagete_slides = value
 
     def update_annotation_number(self, value):
         self.annotation_number = value
         self.color_label.setStyleSheet(f"color: rgb{annotation_palette[self.annotation_number]};")  # Light blue
+        self.color_slider.setValue(self.annotation_number)
 
     def update_intensity_range(self, value):
         low, high = value
@@ -568,10 +832,11 @@ class DICOMViewer(QMainWindow):
                     self.annotation_map = loaded
                     self.update_slice(self.slice_index)
                     self.last_saved_name = path
+                    self.logging(f"Open annotation : {path}")
                 else:
-                    print(f"Shape mismatch ({loaded.shape, self.annotation_map.shape}). Annotation not loaded.")
+                    self.logging(f"Shape mismatch ({loaded.shape, self.annotation_map.shape}). Annotation not loaded.")
         except Exception as e:
-            print(f"Failed to load annotation: {e}") 
+            self.logging(f"Failed to load annotation: {e}") 
 
     def toggle_annotation_visibility(self):
         self.annotation_visible = not self.annotation_visible
@@ -612,22 +877,78 @@ class DICOMViewer(QMainWindow):
             self.annotation_mode_button.setText('-')
         self.annotation_mode_button.setShortcut("Tab")
 
-    def toggle_brush_mode(self):
-        if self.brush_mode == 'Auto':
+    def toggle_brush_mode(self, mode):
+        if mode == 'Range':
             self.brush_mode = 'Range'
-            self.brush_mode_button.setText('Range')
             self.intensity_label.setVisible(True)
             self.intensity_slider.setVisible(True)
             self.tolerance_label.setVisible(False)
             self.tolerance_slider.setVisible(False)
+            self.propagate_label.setVisible(True)
+            self.propagate_slider.setVisible(True)
+            self.keep_largest_label.setVisible(True)
+            self.keep_largest_button.setVisible(True)
+            self.brush_button_auto.setFont(normalFont)
+            self.brush_button_range.setFont(boldFont)
+            self.brush_button_change.setFont(normalFont)
+            self.brush_button_line.setFont(normalFont)
 
-        elif self.brush_mode == 'Range':
+        elif mode == 'Change':
+            self.brush_mode = 'Change'
+            self.intensity_label.setVisible(False)
+            self.intensity_slider.setVisible(False)
+            self.tolerance_label.setVisible(False)
+            self.tolerance_slider.setVisible(False)
+            self.propagate_label.setVisible(False)
+            self.propagate_slider.setVisible(False)
+            self.keep_largest_label.setVisible(False)
+            self.keep_largest_button.setVisible(False)
+            self.brush_button_auto.setFont(normalFont)
+            self.brush_button_range.setFont(normalFont)
+            self.brush_button_change.setFont(boldFont)
+            self.brush_button_line.setFont(normalFont)
+
+
+        elif mode == 'Auto':
             self.brush_mode = 'Auto'
-            self.brush_mode_button.setText('Auto')
             self.intensity_label.setVisible(False)
             self.intensity_slider.setVisible(False)
             self.tolerance_label.setVisible(True)
             self.tolerance_slider.setVisible(True)
+            self.propagate_label.setVisible(True)
+            self.propagate_slider.setVisible(True)
+            self.keep_largest_label.setVisible(False)
+            self.keep_largest_button.setVisible(False)
+            self.brush_button_auto.setFont(boldFont)
+            self.brush_button_range.setFont(normalFont)
+            self.brush_button_change.setFont(normalFont)
+            self.brush_button_line.setFont(normalFont)
+
+        elif mode == "Line":
+            self.brush_mode = 'Line'
+            self.intensity_label.setVisible(True)
+            self.intensity_slider.setVisible(True)
+            self.tolerance_label.setVisible(False)
+            self.tolerance_slider.setVisible(False)
+            self.propagate_label.setVisible(True)
+            self.propagate_slider.setVisible(True)
+            self.keep_largest_label.setVisible(True)
+            self.keep_largest_button.setVisible(True)
+            self.brush_button_auto.setFont(normalFont)
+            self.brush_button_range.setFont(normalFont)
+            self.brush_button_change.setFont(normalFont)
+            self.brush_button_line.setFont(boldFont)
+
+    def toggle_keep_largest(self):
+        if self.keep_largest_mode == "None":
+            self.keep_largest_button.setText("3D")
+            self.keep_largest_mode = "3D"
+        elif self.keep_largest_mode == "3D":
+            self.keep_largest_button.setText("2D")
+            self.keep_largest_mode = "2D"
+        elif self.keep_largest_mode == "2D":
+            self.keep_largest_button.setText("None")
+            self.keep_largest_mode = "None"
 
     def update_windowing_slider(self):
         # Update window center and width from slider values
@@ -667,13 +988,11 @@ class DICOMViewer(QMainWindow):
         try:
             center = float(self.center_input.text())
             width = float(self.width_input.text())
-            if width <= 0:
-                raise ValueError("Width must be > 0")
             self.window_center = center
             self.window_width = width
             self.update_slice(self.slice_index)
         except ValueError as e:
-            print("Invalid windowing values:", e)
+            self.logging("Invalid windowing values:", e)
 
     def go_to_previous(self):
         if self.slice_index > 0:
@@ -686,40 +1005,134 @@ class DICOMViewer(QMainWindow):
     def tolerance_slider_changed(self, value):
         self.tolerance = value / 100.0  
 
-    def annotate_pixel_range(self, y, x):
+    def set_volume_intensity(self, y, x):
+        z = self.slice_index
+        high = int(self.volume[z, y, x])
+        self.update_intensity_range((self.intensity_min, high))
+        self.intensity_slider.setValue((self.intensity_min, high))  # Set initial lower and upper bounds
+
+    def annotate_pixel_range(self, y, x, direction, drag=False):
+        if drag is False:
+            self.annotation_map_backup = self.annotation_map.copy()
         z = self.slice_index
         R = self.brush_size
 
+        if direction == '-':
+            z_min = z
+            z_max = z + 1
+        elif direction=='left':
+            z_min = z - self.propagete_slides
+            z_max = z + 1  
+        elif direction=='right':
+            z_min = z
+            z_max = z + self.propagete_slides + 1
+        else:
+            z_min = z - self.propagete_slides
+            z_max = z + self.propagete_slides + 1
+        
         y_min = max(0, y - R)
         y_max = min(self.volume.shape[1], y + R + 1)
         x_min = max(0, x - R)
         x_max = min(self.volume.shape[2], x + R + 1)
 
         # Extract ROI from volume
-        roi = self.volume[z, y_min:y_max, x_min:x_max]
+        roi = self.volume[z_min:z_max, y_min:y_max, x_min:x_max]
 
         # Create circular mask
-        H, W = roi.shape
+        _, H, W = roi.shape
         Y, X = np.ogrid[0:H, 0:W]
         center_y, center_x = y - y_min, x - x_min
         dist_sq = (Y - center_y)**2 + (X - center_x)**2
-        circular_mask = dist_sq <= R**2
-
+        circular_mask_slice = dist_sq <= R**2
+        circular_mask = np.repeat(circular_mask_slice[None], z_max-z_min, axis=0)
         # Intensity threshold mask
         intensity_mask = (roi >= self.intensity_min) & (roi <= self.intensity_max)
 
         # Final mask: inside circle and within intensity range
         mask = circular_mask & intensity_mask
-
+        mask = keep_largest_component(mask, self.keep_largest_mode, direction=direction)
+            
         # Save undo information and apply annotation
         undo_entry = []
         local_indices = np.argwhere(mask)
-        for dy_, dx_ in local_indices:
+        for dz_, dy_, dx_ in local_indices:
+            global_z = z_min + dz_
             global_y = y_min + dy_
             global_x = x_min + dx_
-            old_val = self.annotation_map[z, global_y, global_x]
-            undo_entry.append((z, global_y, global_x, old_val))
-            self.annotation_map[z, global_y, global_x] = self.annotation_number
+            old_val = self.annotation_map_backup[global_z, global_y, global_x]
+            undo_entry.append((global_z, global_y, global_x, old_val))
+            self.annotation_map[global_z, global_y, global_x] = self.annotation_number
+        if drag:
+            if len(self.annotation_history) > 0:
+                self.annotation_history[-1].extend(undo_entry)
+        else:
+            self.annotation_history.append(undo_entry)
+        self.update_slice(z)
+
+    def annotate_pixel_change(self, y, x):
+        z = self.slice_index
+        current_anno = self.annotation_map[z, y, x]
+        if current_anno == 0: 
+            self.logging("Background has been clicked")
+            return
+        labeled, _ = label(self.annotation_map == current_anno)
+        mask = None
+        for k in np.unique(labeled):
+            if k == 0: continue
+            if (labeled == k)[z, y, x] > 0:
+                mask = (labeled == k)
+                break
+
+        # Save undo information and apply annotation
+        if mask is not None:
+            undo_entry = []
+            global_indices = np.argwhere(mask)
+            for global_z, global_y, global_x in global_indices:
+                old_val = self.annotation_map[global_z, global_y, global_x]
+                undo_entry.append((global_z, global_y, global_x, old_val))
+                self.annotation_map[global_z, global_y, global_x] = self.annotation_number
+
+            self.annotation_history.append(undo_entry)
+            self.update_slice(z)
+        else:
+            self.logging("There is no cluster")
+
+    def annotate_pixel_line(self, src, dst, direction):
+        x1, y1 = src
+        x2, y2 = dst
+        z = self.slice_index
+
+        if direction == '-':
+            z_min = z
+            z_max = z + 1
+        elif direction=='left':
+            z_min = z - self.propagete_slides
+            z_max = z + 1  
+        elif direction=='right':
+            z_min = z
+            z_max = z + self.propagete_slides + 1
+        else:
+            z_min = z - self.propagete_slides
+            z_max = z + self.propagete_slides + 1
+
+
+        line_mask_slice = np.zeros_like(self.volume[0])
+        cv2.line(line_mask_slice, (x1, y1), (x2, y2), color=1, thickness=self.brush_size)
+        line_mask = np.repeat(line_mask_slice[None], z_max-z_min, axis=0)
+
+        roi = self.volume[z_min:z_max]
+        intensity_mask = (roi >= self.intensity_min) & (roi <= self.intensity_max)
+        mask = line_mask & intensity_mask
+
+        mask = keep_largest_component(mask, self.keep_largest_mode, direction=direction)
+
+        undo_entry = []
+        local_indices = np.argwhere(mask)
+        for dz_, global_y, global_x in local_indices:
+            global_z = z_min + dz_
+            old_val = self.annotation_map[global_z, global_y, global_x]
+            undo_entry.append((global_z, global_y, global_x, old_val))
+            self.annotation_map[global_z, global_y, global_x] = self.annotation_number
 
         self.annotation_history.append(undo_entry)
         self.update_slice(z)
@@ -761,15 +1174,15 @@ class DICOMViewer(QMainWindow):
 
         component_label = labeled[local_y, local_x]
         if component_label == 0:
-            print(f"No connected component (Intensity : {intensity})")
+            self.logging(f"No connected component (Intensity : {intensity})")
             return
 
         # Initialize mask accumulator with zeros (for all slices in ROI)
-        accum_mask = np.zeros((min(self.volume.shape[0], z + roi_radius + 1) - max(0, z - roi_radius),
+        accum_mask = np.zeros((min(self.volume.shape[0], z + self.propagete_slides + 1) - max(0, z - self.propagete_slides),
                             y_max - y_min, x_max - x_min), dtype=bool)
 
-        z_start = max(0, z - roi_radius)
-        z_end = min(self.volume.shape[0], z + roi_radius + 1)
+        z_start = max(0, z - self.propagete_slides)
+        z_end = min(self.volume.shape[0], z + self.propagete_slides + 1)
 
         # Set initial mask in current slice (relative index)
         accum_mask[z-z_start] = (labeled == component_label)
@@ -904,7 +1317,7 @@ class DICOMViewer(QMainWindow):
         # Find label of component at clicked voxel
         comp_label = labeled[z, y, x]
         if comp_label == 0:
-            print("No connected component found at clicked voxel.")
+            self.logging("No connected component found at clicked voxel.")
             return
 
         # Find slices to remove annotation in
@@ -912,20 +1325,20 @@ class DICOMViewer(QMainWindow):
             z_min = z
             z_max = z + 1
         elif direction=='left':
-            z_min = 0
+            z_min = z - self.propagete_slides
             z_max = z + 1  
         elif direction=='right':
             z_min = z
-            z_max = ann_map.shape[0]  
+            z_max = z + self.propagete_slides + 1
         else:
-            z_min = 0
-            z_max = ann_map.shape[0]  
+            z_min = z - self.propagete_slides
+            z_max = z + self.propagete_slides + 1
 
         # Create mask for voxels to remove:
         # Only those in the connected component AND in slices in [z_min, z_max)
         mask_remove = np.zeros_like(ann_map, dtype=bool)
         for slice_idx in range(z_min, z_max):
-            mask_slice = (labeled[slice_idx] == comp_label) & (self.annotation_map == self.annotation_number)
+            mask_slice = (labeled[slice_idx] == comp_label) & (self.annotation_map[slice_idx] == self.annotation_number)
             mask_remove[slice_idx] = mask_slice
 
         # Save old annotation values for undo
@@ -964,7 +1377,7 @@ class DICOMViewer(QMainWindow):
                 np.save(save_path, np.transpose(anno, (1,2,0)))
                 self.last_saved_name = save_path
         else:
-            raise NotImplementedError
+            self.logging("Invalid file mode", self.file_mode)
 
     def save_annotation(self):
         if self.last_saved_name is None:
@@ -978,9 +1391,9 @@ class DICOMViewer(QMainWindow):
             elif self.file_mode == "numpy":
                 np.save(self.last_saved_name, np.transpose(anno, (1,2,0)))
             else:
-                raise NotImplementedError
+                self.logging("Invalid file mode", self.file_mode)
         if self.last_saved_name:
-            print(f"{self.last_saved_name} Save complete")
+            self.logging(f"Save complete : {self.last_saved_name}")
 
 def main():
     app = QApplication(sys.argv)
