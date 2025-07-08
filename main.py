@@ -1,8 +1,6 @@
 import sys
 import os
 import numpy as np
-import SimpleITK as sitk
-
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QSlider,
     QPushButton, QHBoxLayout, QFileDialog, QScrollArea,
@@ -10,35 +8,18 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QWheelEvent, QPainter, QColor, QPen, QIcon, QFont
-from PyQt5.QtWidgets import QShortcut, QTextEdit, QTreeView, QFileSystemModel, QSplitter, QSizePolicy, QMenu, QAction
+from PyQt5.QtWidgets import QShortcut, QTextEdit, QTreeView, QFileSystemModel, QSplitter, QSizePolicy, QMenu, QAction, QMessageBox
 from PyQt5.QtGui import QKeySequence
 from qtrangeslider import QRangeSlider
 from scipy.ndimage import label
-
 from scipy.ndimage import binary_fill_holes, binary_closing
 from scipy.ndimage import generate_binary_structure
 from scipy.ndimage import binary_dilation
 import nibabel as nib
-import pydicom
 from glob import glob
 import cv2
-from skimage.measure import regionprops
-annotation_palette = [
-    (0, 0, 0), # dummy
-    (228, 26, 28),    # Red
-    (55, 126, 184),   # Blue
-    (77, 175, 74),    # Green
-    (255, 127, 0),    # Orange
-    (152, 78, 163),   # Purple
-    (166, 86, 40),    # Brown
-    (255, 0, 144),    # Pink
-    (0, 206, 209),    # Cyan
-    (255, 255, 51),   # Yellow
-]
-
-normalFont = QFont()
-boldFont = QFont()
-boldFont.setBold(True)  
+from functions import keep_largest_component, read_dicoms, apply_windowing
+from constant import ColorPalette, normalFont, boldFont
 
 class QToggleButton(QPushButton):
     clicked_after_bold = pyqtSignal()
@@ -64,162 +45,6 @@ class QToggleButton(QPushButton):
 
 class QToggleButtonGroup(list):
     pass
-
-
-def keep_largest_component(mask, mode, num_components=1, direction=None):
-    assert len(mask.shape) == 3
-    if mode == "None":
-        return mask
-    elif mode == "3D":
-        labeled, _ = label(mask)
-        props = regionprops(labeled)
-        props_sorted = sorted(props, key=lambda x: x.area, reverse=True)
-        output = np.zeros_like(mask)
-        for i in range(min(num_components, len(props_sorted))):
-            output[labeled == props_sorted[i].label] = 1
-        return output.astype(mask.dtype)
-    elif mode == "2D":
-        assert direction is not None
-        output = np.zeros_like(mask)
-        positive_slices = np.unique(np.argwhere(mask)[..., 0])
-        if direction == 'all':
-            z_mid = mask.shape[0] // 2
-            mask_left = mask.copy()
-            mask_right = mask.copy()
-            mask_left[z_mid:] = 0
-            mask_right[:z_mid] = 0
-            output_left = keep_largest_component(mask_left, mode, direction='left')
-            output_right = keep_largest_component(mask_right, mode, direction='right')
-            output = np.logical_or(output_left, output_right)
-        else:
-            if direction == 'left':
-                positive_slices = positive_slices[::-1]
-            last_slice = np.ones_like(mask[0])
-            for s in positive_slices:
-                if mask[s].sum() == 0:
-                    break
-                if (last_slice * mask[s]).sum() == 0:
-                    break
-                labeled, _ = label(mask[s])
-                for k in np.unique(labeled):
-                    if k == 0: continue
-                    if ((labeled == k) * last_slice).sum() == 0:
-                        labeled[labeled == k] = 0
-                labeled, _ = label(labeled > 0)
-                props = regionprops(labeled)
-                props_sorted = sorted(props, key=lambda x: x.area, reverse=True)
-                output_slice = np.zeros_like(mask[s])
-                for i in range(min(num_components, len(props_sorted))):
-                    output_slice[labeled == props_sorted[i].label] = 1
-                output[s] = output_slice
-                last_slice = output_slice
-        return output.astype(mask.dtype)
-    else:
-        print("Keep_largest_component : Invalid mode", mode)
-        return mask
-
-def read_dicom(dcm_path, rescale=False):
-    dcm = pydicom.dcmread(dcm_path,force=True)
-    if not hasattr(dcm.file_meta,'TransferSyntaxUID'):
-        dcm.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian  # type: ignore
-    required_elements = ['PixelData', 'BitsAllocated', 'Rows', 'Columns',
-                     'PixelRepresentation', 'SamplesPerPixel','PhotometricInterpretation',
-                        'BitsStored','HighBit']
-    missing = [elem for elem in required_elements if elem not in dcm]
-    for elem in required_elements:
-        if elem not in dcm:
-            if elem== 'BitsAllocated':
-                dcm.BitsAllocated = 16
-            if elem== 'PixelRepresentation':
-                dcm.PixelRepresentation = 1
-            if elem== 'SamplesPerPixel':
-                dcm.SamplesPerPixel = 1
-            if elem== 'PhotometricInterpretation':
-                dcm.PhotometricInterpretation = 'MONOCHROME2'
-            if elem== 'BitsStored':
-                dcm.BitsStored = 12
-            if elem== 'BitsStored':
-                dcm.BitsStored = 11
-    if rescale: # For CT
-        arr = dcm.pixel_array
-        arr_hu = (arr * dcm.RescaleSlope + dcm.RescaleIntercept).astype(np.int16)
-        dcm.PixelRepresentation = 1
-        dcm.PixelData = arr_hu.tobytes()
-    else:
-        if dcm.PixelRepresentation == 1:
-            arr = dcm.pixel_array
-            overflow_threshold = 1 << (dcm.BitsStored-1)
-            arr[arr >= overflow_threshold] = 0
-            dcm.PixelData = arr.tobytes()
-    return dcm
-
-def read_dicoms(dcm_path, 
-                slice_first=False, 
-                autoflip=False, 
-                return_metadata=False,
-                metadata_list=[],
-                rescale=False):
-    dcm_list = sorted(glob(os.path.join(dcm_path, "*.dcm")))
-    dcm_array = []
-    instance_num = []
-    sl_loc = []
-    dcm_infos = []
-    for sl in range(len(dcm_list)):
-        dcm_info = read_dicom(dcm_list[sl], rescale=rescale)
-        dcm_infos.append(dcm_info)
-        dcm_array.append(dcm_info.pixel_array)
-        instance_num.append(dcm_info.InstanceNumber)
-        sl_loc.append(np.float16(dcm_info.ImagePositionPatient[2]))
-
-    dcm_array  = np.array(dcm_array)
-    dcm_array[np.isnan(dcm_array)] = 0
-    sort_idx = np.argsort(instance_num)
-    dcm_array = np.array(dcm_array)[sort_idx]
-    sl_loc = np.array(sl_loc)[sort_idx]
-    dcm_infos = np.array(dcm_infos)[sort_idx]
-
-    flip_idx = sl_loc[0] > sl_loc[-1]
-    if flip_idx and autoflip:
-        dcm_array = np.flip(dcm_array,0)
-    
-    if not slice_first:
-        dcm_array = np.transpose(dcm_array,(1,2,0))
-
-    pixel_spacing = dcm_infos[0].PixelSpacing
-    if hasattr(dcm_infos[0],'SpacingBetweenSlices'):
-        slice_spacing = dcm_infos[0].SpacingBetweenSlices
-    else:
-        slice_spacing = abs(dcm_infos[1].ImagePositionPatient[2] - dcm_infos[0].ImagePositionPatient[2])
-    if hasattr(dcm_infos[0], 'SliceThickness'):
-        thickness = dcm_infos[0].SliceThickness
-    else:
-        thickness  = dcm_infos[0].SpacingBetweenSlices
-
-    return_array = dcm_array
-
-    if return_metadata:
-        metadata = {
-            "pixel_spacing" : (float(pixel_spacing[0]), float(pixel_spacing[1])),
-            "slice_spacing" : float(slice_spacing),
-            "thickness" : float(thickness),
-            "flip_idx": flip_idx
-        }
-        for tag in metadata_list:
-            L = []
-            for dcm_info in dcm_infos:
-                L.append(getattr(dcm_info, tag, None))
-            metadata[tag] = L
-        return return_array, metadata
-    else:
-        return return_array 
-
-
-def apply_windowing(image_2d, center, width):
-    img = image_2d.astype(np.float32)
-    min_val = center - (width / 2)
-    max_val = center + (width / 2)
-    windowed = np.clip((img - min_val) / (max_val - min_val) * 255.0, 0, 255)
-    return windowed.astype(np.uint8)
 
 
 class ImageLabel(QLabel):
@@ -358,7 +183,7 @@ class ImageLabel(QLabel):
         super().paintEvent(event)  # Draw image normally
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        r, g, b = annotation_palette[self.parent.annotation_number]
+        r, g, b = self.parent.annotation_palette[self.parent.annotation_number]
         if self.parent.brush_mode == "Range" and self.cursor_pos:
             color = QColor(r, g, b, 100)
             painter.setBrush(color)
@@ -419,16 +244,20 @@ class DICOMViewer(QMainWindow):
         self.brush_mode = 'Auto'
         self.window_center = 3000
         self.window_width = 3000
+        self.pixel_spacing = 1.0
+        self.slice_spacing = 1.0
+        self.slice_thickness = 1.0
         self.intensity_min = 0
         self.intensity_max = 300
         self.probe_mode = False
         self.flip_idx = False
         self.annotation_visible = True
-        self.title = "DICOM Annotation tool"
+        self.title = "Medical Annotation tool"
         self.last_dirname = os.getcwd()
         self.last_basename = os.getcwd()
         self.annotation_number = 1
         self.keep_largest_mode = "None"
+        self.annotation_palette = ColorPalette(self)
         self.initialize()
         self.refresh()
 
@@ -469,7 +298,8 @@ class DICOMViewer(QMainWindow):
         self.slider.setMaximum(200)
         self.slider.setValue(100)
         self.slider.valueChanged.connect(self.update_slice)
-        controls_layout.addWidget(QLabel("Slice"))
+        self.slice_widget = QLabel(f"Slice 1/1")
+        controls_layout.addWidget(self.slice_widget)
         controls_layout.addWidget(self.slider)
 
         # Window Center
@@ -538,7 +368,7 @@ class DICOMViewer(QMainWindow):
         self.color_slider.setValue(self.annotation_number)
         self.color_slider.valueChanged.connect(self.update_annotation_number)
         self.color_label = QLabel(f"Color ■")
-        self.color_label.setStyleSheet(f"color: rgb{annotation_palette[self.annotation_number]};")  # Light blue
+        self.color_label.setStyleSheet(f"color: rgb{self.annotation_palette[self.annotation_number]};")  # Light blue
         controls_layout.addWidget(self.color_label)
         controls_layout.addWidget(self.color_slider)
         for i in range(1, 10):  # keys 1~9
@@ -705,6 +535,22 @@ class DICOMViewer(QMainWindow):
         file_menu.addAction(save_action)
         file_menu.addAction(save_action_new)
 
+        info_menu = menubar.addMenu("Help")
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_notice)
+        info_menu.addAction(about_action)
+
+
+    def show_notice(self):
+        notice_text = (
+            "Copyright © 2025 Minhyuk Choi. All rights reserved.\n\n"
+            "[Contact]\n"
+            "mhchoi@jlkgroup.com\n"
+            "https://github.com/cmh1027/medical-annotation-tool"
+        )
+
+        QMessageBox.information(self, "Medical Annotation tool", notice_text)
+
     def open(self, folder=None):
         if folder is None:
             folder = QFileDialog.getExistingDirectory(
@@ -725,9 +571,15 @@ class DICOMViewer(QMainWindow):
                     self.flip_idx = 0
                     self.refresh()
                     self.load_annotation(path=os.path.join(folder, "label.npy"))
+                    self.pixel_spacing = 1.0
+                    self.slice_spacing = 1.0
+                    self.slice_thickness = 1.0
                 else:
                     self.file_mode = "dicom"
                     volume, metadata = read_dicoms(folder, return_metadata=True, metadata_list=["WindowCenter", "WindowWidth"], slice_first=True, autoflip=True)
+                    self.pixel_spacing = float(metadata['pixel_spacing'][0])
+                    self.slice_spacing = float(metadata['slice_spacing'])
+                    self.slice_thickness = float(metadata['thickness'])
                     N = volume.shape[0]
                     self.volume = volume
                     self.window_center = metadata['WindowCenter'][N//2]
@@ -809,7 +661,7 @@ class DICOMViewer(QMainWindow):
 
     def update_annotation_number(self, value):
         self.annotation_number = value
-        self.color_label.setStyleSheet(f"color: rgb{annotation_palette[self.annotation_number]};")  # Light blue
+        self.color_label.setStyleSheet(f"color: rgb{self.annotation_palette[self.annotation_number]};")  # Light blue
         self.color_slider.setValue(self.annotation_number)
 
     def update_intensity_range(self, value):
@@ -959,7 +811,9 @@ class DICOMViewer(QMainWindow):
 
     def update_slice(self, index, alpha=0.5):
         if self.volume is None: return
+        self.slice_widget.setText(f"Slice {index} / {self.annotation_map.shape[0]}")
         self.slice_index = index
+        ann = self.annotation_map[self.slice_index]
         raw_slice = self.volume[self.slice_index]
         windowed = apply_windowing(raw_slice, self.window_center, self.window_width)
 
@@ -967,20 +821,41 @@ class DICOMViewer(QMainWindow):
         rgb = np.stack([windowed] * 3, axis=-1).astype(np.float32)
 
         if self.annotation_visible:
-            ann = self.annotation_map[self.slice_index]
             for k in np.unique(ann):
                 if k == 0: continue
                 overlay = np.zeros_like(rgb)
                 for channel in [0, 1, 2]:
-                    overlay[..., channel] = annotation_palette[k][channel]  # Red channel
+                    overlay[..., channel] = self.annotation_palette[k][channel]  # Red channel
                 mask = (ann == k)
                 rgb[mask] = (1 - alpha) * rgb[mask] + alpha * overlay[mask]
 
-        # Convert to uint8 for QImage
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         h, w, _ = rgb.shape
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
-        self.image_label.setPixmap(QPixmap.fromImage(qimg))
+    
+        pixmap = QPixmap.fromImage(qimg)
+        painter = QPainter(pixmap)
+        painter.setFont(QFont("Arial", 7))
+
+        texts = []
+        for k in np.unique(ann):
+            if k == 0: continue
+            r, g, b = self.annotation_palette[k]
+            if self.file_mode == "dicom":
+                volume = (self.pixel_spacing ** 2) * self.slice_thickness * (ann == k).sum() / 1000
+                text = (f"Volume: {'%.4f' % volume}mL", QColor(r, g, b))
+            else:
+                voxel = (ann == k).sum()
+                text = (f"Volume: {'%.4f' % voxel} voxels", QColor(r, g, b))
+            texts.append(text)
+        y_offset = 15
+        for text, color in texts:
+            painter.setPen(color)
+            painter.drawText(5, y_offset, text)
+            y_offset += 10  # spacing between lines
+        painter.end()
+
+        self.image_label.setPixmap(pixmap)
         self.image_label.update_scaled_pixmap()
 
 
