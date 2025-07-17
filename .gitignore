@@ -3,3 +3,4 @@
 !/modules/
 !/asset/**
 !/modules/**
+modules/**/__pycache__/
