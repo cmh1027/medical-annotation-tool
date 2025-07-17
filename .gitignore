@@ -1,2 +1,5 @@
-*.ipynb
-**/
+/*
+!/asset/
+!/modules/
+!/asset/**
+!/modules/**
