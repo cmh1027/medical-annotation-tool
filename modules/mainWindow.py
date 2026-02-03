@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QWheelEvent, QPainter, QColor, QPen, QIcon, QFont
-from PyQt5.QtWidgets import QShortcut, QTextEdit, QTreeView, QFileSystemModel, QSplitter, QSizePolicy, QMenu, QAction, QMessageBox
+from PyQt5.QtWidgets import QShortcut, QTextEdit, QTreeView, QFileSystemModel, QSplitter, QSizePolicy, QMenu, QAction, QMessageBox, QCheckBox
 from PyQt5.QtGui import QKeySequence
 from qtrangeslider import QRangeSlider
 from scipy.ndimage import label
@@ -19,10 +19,12 @@ from glob import glob
 import cv2
 from modules.functions import keep_largest_component, read_dicoms, apply_windowing
 from modules.constant import ColorPalette, normalFont, boldFont
-from modules.customWidget import QToggleButton, QToggleButtonGroup
+from modules.customWidget import QToggleButton, QToggleButtonGroup, MarkerSlider
 from modules.imagePanel import ImageLabel
 from modules.dialogue.fileSetting import FileSettingsDialog
 from tqdm import tqdm
+import traceback
+import shutil
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -48,14 +50,21 @@ class MainWindow(QMainWindow):
         self.flip_idx = False
         self.annotation_visible = True
         self.update_volume = True
+        self.show_positive_slices = True
+        self.overwrite = False
+        self.brain_mask = np.ones_like(self.volume).astype(np.uint8)
         self.last_dirname = os.getcwd()
         self.last_basename = os.getcwd()
         self.annotation_number = 1
         self.keep_largest_mode = "None"
         self.nifti_default_load_name = ""
         self.numpy_default_load_name = ""
-        self.nifti_default_save_name = "annotation.nii"
+        self.nifti_default_save_name = ""
         self.numpy_default_save_name = "label.npy"
+        self.default_intensity_min = 0
+        self.default_intensity_max = 20
+        self.nifti_save_name = ""
+        self.patient_id = ""
         self.annotation_palette = ColorPalette(self)
         self.volume_text_cache = []
         self.initialize()
@@ -72,6 +81,10 @@ class MainWindow(QMainWindow):
     @property
     def volume_shape(self):
         return self.volume.shape
+    
+    @property
+    def positive_slices(self):
+        return np.unique(np.argwhere(self.annotation_map)[..., 0]).tolist()
 
     def refresh(self):
         self.scale_factor = 10
@@ -81,16 +94,16 @@ class MainWindow(QMainWindow):
         self.annotation_visible = True
         self.setWindowTitle(self.title)
 
-        self.slider.setMinimum(0)
-        self.slider.setMaximum(self.slice_count - 1)
-        self.slider.setValue(self.slice_index)
+        self.slice_slider.setMinimum(0)
+        self.slice_slider.setMaximum(self.slice_count - 1)
+        self.slice_slider.setValue(self.slice_index)
 
-        self.center_slider.setMinimum(0)
-        self.center_slider.setMaximum(6000)
+        self.center_slider.setMinimum(self.volume.min())
+        self.center_slider.setMaximum(self.volume.max())
         self.center_slider.setValue(int(self.window_center))
 
         self.width_slider.setMinimum(0)
-        self.width_slider.setMaximum(6000)
+        self.width_slider.setMaximum(int(self.volume.max()) - int(self.volume.min()))
         self.width_slider.setValue(int(self.window_width))
 
     def initialize(self):
@@ -104,14 +117,14 @@ class MainWindow(QMainWindow):
         controls_layout.setAlignment(Qt.AlignTop)
 
         # Slice slider
-        self.slider = QSlider(Qt.Horizontal)
-        self.slider.setMinimum(0)
-        self.slider.setMaximum(200)
-        self.slider.setValue(100)
-        self.slider.valueChanged.connect(self.update_slice)
+        self.slice_slider = MarkerSlider(Qt.Horizontal)
+        self.slice_slider.setMinimum(0)
+        self.slice_slider.setMaximum(200)
+        self.slice_slider.setValue(100)
+        self.slice_slider.valueChanged.connect(lambda index:self.update_slice(index, no_ps_update=True))
         self.slice_widget = QLabel(f"Slice 1/1")
         controls_layout.addWidget(self.slice_widget)
-        controls_layout.addWidget(self.slider)
+        controls_layout.addWidget(self.slice_slider)
 
         # Window Center
         self.center_slider = QSlider(Qt.Horizontal)
@@ -182,9 +195,6 @@ class MainWindow(QMainWindow):
         self.color_label.setStyleSheet(f"color: rgb{self.annotation_palette[self.annotation_number]};")  # Light blue
         controls_layout.addWidget(self.color_label)
         controls_layout.addWidget(self.color_slider)
-        for i in range(1, 10):  # keys 1~9
-            shortcut = QShortcut(QKeySequence(f"F{i}"), self)
-            shortcut.activated.connect(lambda i=i: self.update_annotation_number(i))  # capture i correctly
 
         # Annotation Mode Button
         annotation_mode_layout = QHBoxLayout()
@@ -194,7 +204,13 @@ class MainWindow(QMainWindow):
         self.annotation_mode_button.setShortcut("Tab")
         annotation_mode_layout.addWidget(QLabel("Mode"))
         annotation_mode_layout.addWidget(self.annotation_mode_button)
+        self.show_ps_checkbox = QCheckBox("Show PS")
+        self.show_ps_checkbox.setChecked(True)
+        self.show_ps_checkbox.toggled.connect(self.toggle_show_ps)
+        annotation_mode_layout.addWidget(self.show_ps_checkbox)
+
         controls_layout.addLayout(annotation_mode_layout)
+        
 
         brush_mode_layout = QHBoxLayout()
         brush_mode_layout.setAlignment(Qt.AlignLeft)
@@ -230,32 +246,44 @@ class MainWindow(QMainWindow):
 
         misc1_layout = QHBoxLayout()
         misc1_layout.setAlignment(Qt.AlignLeft)
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.clicked.connect(self.clear_annotation)
+        misc1_layout.addWidget(self.clear_button)
         self.probe_button = QToggleButton("Probe")
         self.probe_button.clicked.connect(self.toggle_probe)
         misc1_layout.addWidget(self.probe_button)
         self.inverse_button = QToggleButton("Inverse")
         self.inverse_button.clicked.connect(self.inverse_intensity)
         misc1_layout.addWidget(self.inverse_button)
-        
+        self.custom_button = QPushButton("Custom")
+        self.custom_button.clicked.connect(lambda: self.custom_function(1))
+        misc1_layout.addWidget(self.custom_button)
 
         misc2_layout = QHBoxLayout()
         misc2_layout.setAlignment(Qt.AlignLeft)
+        self.no_overwrite_button = QToggleButton("Overwrite")
+        self.no_overwrite_button.clicked.connect(self.toggle_overwrite)
+        misc2_layout.addWidget(self.no_overwrite_button)
+
+        misc3_layout = QHBoxLayout()
+        misc3_layout.setAlignment(Qt.AlignLeft)
         self.noise_label = QLabel(f"Noise {self.noise_pixels} / 100")
-        misc2_layout.addWidget(self.noise_label)
+        misc3_layout.addWidget(self.noise_label)
         self.noise_slider = QSlider(Qt.Horizontal)
         self.noise_slider.setMinimum(0)
         self.noise_slider.setMaximum(100)
         self.noise_slider.setValue(self.noise_pixels)
         self.noise_slider.valueChanged.connect(self.update_noise_from_slider)
-        misc2_layout.addWidget(self.noise_slider)
+        misc3_layout.addWidget(self.noise_slider)
         self.noise_removal_button = QPushButton("Remove")
         self.noise_removal_button.clicked.connect(self.remove_noise)
-        misc2_layout.addWidget(self.noise_removal_button)
+        misc3_layout.addWidget(self.noise_removal_button)
 
 
 
         misc_layout.addLayout(misc1_layout)
         misc_layout.addLayout(misc2_layout)
+        misc_layout.addLayout(misc3_layout)
         controls_layout.addLayout(misc_layout)
         
 
@@ -314,7 +342,12 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("d"), self).activated.connect(self.change_annotation_mode_right)
         QShortcut(QKeySequence("w"), self).activated.connect(self.change_annotation_mode_all)
         QShortcut(QKeySequence("s"), self).activated.connect(self.change_annotation_mode_one)
-
+        QShortcut(QKeySequence("f"), self).activated.connect(self.decrease_intensity_min)
+        QShortcut(QKeySequence("g"), self).activated.connect(self.increase_intensity_min)
+        for i in range(1, 9):
+            key = f"F{i}"
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.activated.connect(lambda x=i: self.custom_function(x))
         # Menu bar setup
         self.create_menu()
         self.file_mode = "dicom"
@@ -329,13 +362,20 @@ class MainWindow(QMainWindow):
         if self.file_model.isDir(index):
             menu = QMenu()
             open_action = QAction("Open", self.navigator)
+            delete_action = QAction("Delete", self.navigator)
     
             def open_folder():
                 folder = self.file_model.filePath(index)
                 self.open(folder=folder)
             
+            def delete_folder():
+                folder = self.file_model.filePath(index)
+                shutil.rmtree(folder)
+            
             open_action.triggered.connect(open_folder)
+            delete_action.triggered.connect(delete_folder)
             menu.addAction(open_action)
+            menu.addAction(delete_action)
             menu.exec_(self.navigator.viewport().mapToGlobal(point))
         
 
@@ -414,6 +454,7 @@ class MainWindow(QMainWindow):
             self.numpy_default_load_name = settings['numpy_default_load']
             self.nifti_default_save_name = settings['nifti_default_save']
             self.numpy_default_save_name = settings['numpy_default_save']
+            self.default_intensity_min, self.default_intensity_max = settings['default_intensity']
 
     def show_notice(self):
         notice_text = (
@@ -434,18 +475,22 @@ class MainWindow(QMainWindow):
         try:
             if folder and len(glob(os.path.join(folder, "*.dcm")) + glob(os.path.join(folder, "image.npy"))) > 0:
                 self.title = os.path.basename(folder)
-                if len(list(filter(lambda k:".npy" in k, os.listdir(folder)))):
+                if len(list(filter(lambda k:".npy" in k, os.listdir(folder)))) > 0 and os.path.exists(os.path.join(folder, "image.npy")):
                     self.file_mode = "numpy"
-                    self.volume = np.transpose(np.load(os.path.join(folder, "image.npy")), (2,0,1))
+                    self.volume = np.transpose(np.load(os.path.join(folder, "image.npy")), (2,0,1)).astype(np.int16)
                     self.volume -= np.min(self.volume)
                     lower = np.percentile(self.volume, 0.5)
                     upper = np.percentile(self.volume, 99.5)
-                    self.window_center = (upper + lower) / 2
-                    self.window_width = (upper - lower)
+                    window_center = (upper + lower) / 2
+                    window_width = (upper - lower)
                     self.flip_idx = 0
                     self.refresh()
                     if self.numpy_default_load_name == "":
-                        load_name = list(filter(lambda k:k != "image.npy" and k.endswith(".npy"), os.listdir(folder)))[0]
+                        load_name = list(filter(lambda k:k not in ['image.npy', 'brain_mask.npy'] and k.endswith(".npy"), os.listdir(folder)))
+                        if len(load_name) > 0:
+                            load_name = load_name[0]
+                        else:
+                            load_name = ""
                     else:
                         load_name = self.numpy_default_load_name
                     self.load_annotation(path=os.path.join(folder, load_name))
@@ -455,20 +500,23 @@ class MainWindow(QMainWindow):
                     metadata = None
                 else:
                     self.file_mode = "dicom"
-                    metadata_list = ["WindowCenter", "WindowWidth", "SeriesDescription", "Manufacturer"]
-                    volume, metadata = read_dicoms(folder, return_metadata=True, metadata_list=metadata_list, slice_first=True, autoflip=True, rescale=True)
+                    metadata_list = ["WindowCenter", "WindowWidth", "SeriesDescription", "Manufacturer", "RescaleIntercept", "RescaleSlope"]
+                    volume, metadata = read_dicoms(folder, return_metadata=True, metadata_list=metadata_list, slice_first=True, autoflip=True)
                     self.pixel_spacing = float(metadata['pixel_spacing'][0])
                     self.slice_spacing = float(metadata['slice_spacing'])
                     self.slice_thickness = float(metadata['thickness'])
                     N = volume.shape[0]
                     self.volume = volume
-                    self.window_center = metadata['WindowCenter'][N//2]
-                    self.window_width = metadata['WindowWidth'][N//2]
                     try:
-                        self.window_center = self.window_center[0]
-                        self.window_width = self.window_width[0]
-                    except:
-                        pass
+                        window_center = int((metadata['WindowCenter'][N//2] - metadata["RescaleIntercept"][N//2]) / metadata["RescaleSlope"][N//2])
+                        window_width = int((metadata['WindowWidth'][N//2] - metadata["RescaleIntercept"][N//2]) / metadata["RescaleSlope"][N//2])
+                    except TypeError:
+                        if metadata['WindowCenter'][N//2] is not None:
+                            window_center = int((metadata['WindowCenter'][N//2][0] - metadata["RescaleIntercept"][N//2]) / metadata["RescaleSlope"][N//2])
+                            window_width = int((metadata['WindowWidth'][N//2][0] - metadata["RescaleIntercept"][N//2]) / metadata["RescaleSlope"][N//2])
+                        else:
+                            window_center = int(np.percentile(volume, 50))
+                            window_width = int((volume.max() - volume.min()) // 10)
                     self.flip_idx = metadata['flip_idx']
                     self.refresh()
                     if self.nifti_default_load_name == "":
@@ -478,14 +526,34 @@ class MainWindow(QMainWindow):
                         else:
                             anno_path = "None"
                     else:
-                        anno_path = os.path.join(folder, self.numpy_default_load_name)
+                        anno_path = os.path.join(folder, self.nifti_default_load_name)
                     if os.path.exists(anno_path):
                         self.load_annotation(path=anno_path)
+                        if self.nifti_default_save_name == "":
+                            self.nifti_save_name = os.path.basename(anno_path).split(".")[0] + ".nii"
+                    else:
+                        if self.nifti_default_save_name == "":
+                            self.nifti_save_name = os.path.basename(folder) + ".nii"
+                            
+                brain_mask_path = os.path.join(folder, "brain_mask.npy")
+                if os.path.exists(brain_mask_path):
+                    self.brain_mask = np.load(brain_mask_path) > 0
+                    if not np.array_equal(self.brain_mask.shape, self.volume.shape):
+                        self.brain_mask = np.transpose(self.brain_mask, (2,0,1))
+                else:
+                    self.brain_mask = np.ones_like(self.volume) > 0
+                # if self.flip_idx:
+                #     self.brain_mask = np.flip(self.brain_mask, 0)
+                self.patient_id = os.path.basename(folder)
+                self.volume = np.where(self.brain_mask, self.volume, 0)
+                self.update_slice(self.slice_index)
                 self.last_dirname = os.path.dirname(folder)
+
                 self.last_basename = folder
-                self.intensity_slider.setMaximum(self.volume.max() - self.volume.min())
+                self.set_windowing_slider(window_center, window_width)
+                self.intensity_slider.setMaximum(int(self.volume.max()) - int(self.volume.min()))
                 self.intensity_intercept = self.volume.min()
-                self.update_intensity_range((0, self.volume.max()//3))
+                self.intensity_slider.setValue((int(int(self.volume.max()) * self.default_intensity_min / 100), int(int(self.volume.max()) * self.default_intensity_max / 100)))
                 self.volume_inverse = None
                 self.setInfo(metadata)
                 self.logging(f"Open Series : {folder}")
@@ -508,6 +576,18 @@ class MainWindow(QMainWindow):
         else:
             self.inverse_button.setFont(normalFont)
 
+    def toggle_overwrite(self):
+        self.overwrite = not self.overwrite
+
+    def custom_function(self, i=1):
+        try:
+            with open("script.py") as f:
+                exec(f.read()) 
+        except Exception as e:
+            import traceback
+            error_str = traceback.format_exc()
+            self.logging(error_str)
+    
     def toggle_probe(self):
         self.probe_mode = not self.probe_mode
 
@@ -578,6 +658,12 @@ class MainWindow(QMainWindow):
         self.intensity_label.setText(f"Intensity: {(low, high)}")
         self.intensity_min, self.intensity_max = low, high
 
+    def decrease_intensity_min(self):
+        self.intensity_slider.setValue((max(self.intensity_slider.minimum(), self.intensity_min - 10), self.intensity_max))
+
+    def increase_intensity_min(self):
+        self.intensity_slider.setValue((min(self.intensity_slider.maximum(), self.intensity_min + 10), self.intensity_max))
+
     def load_annotation(self, path=None):
         try:
             if not path:
@@ -592,8 +678,8 @@ class MainWindow(QMainWindow):
                     loaded = np.flip(loaded, 0)
                 if loaded.shape == self.volume_shape:
                     self.annotation_map = loaded
-                    self.update_slice(self.slice_index)
                     self.logging(f"Open Annotation : {path}")
+                    self.slice_slider.setMarkedIndices(self.positive_slices)
                 else:
                     self.logging(f"Shape mismatch ({loaded.shape, self.volume_shape}). Annotation not loaded.")
         except Exception as e:
@@ -637,6 +723,10 @@ class MainWindow(QMainWindow):
             self.annotation_mode = '-'
             self.annotation_mode_button.setText('-')
         self.annotation_mode_button.setShortcut("Tab")
+    
+    def toggle_show_ps(self, state):
+        self.show_positive_slices = state
+        self.update_slice(self.slice_index)
 
     def toggle_brush_mode(self, mode):
         if mode == 'Range':
@@ -717,12 +807,17 @@ class MainWindow(QMainWindow):
         self.window_width = self.width_slider.value()
         self.update_slice(self.slice_index)  # Refresh current slice with new windowing
 
+    def set_windowing_slider(self, center, width):
+        self.window_center = int(center)
+        self.window_width = int(width)
+        self.center_slider.setValue(self.window_center)
+        self.width_slider.setValue(self.window_width)
 
-    def update_slice(self, index, alpha=0.5, no_volume_update=False):
+    def update_slice(self, index, alpha=0.5, no_volume_update=False, no_ps_update=False):
         if index is None:
             index = self.slice_index
         if self.volume is None: return
-        self.slice_widget.setText(f"Slice {index} / {self.slice_count}")
+        self.slice_widget.setText(f"Slice {index} / {self.slice_count - 1}")
         self.slice_index = index
         ann = self.annotation_map[self.slice_index]
         raw_slice = self.volume[self.slice_index]
@@ -742,7 +837,7 @@ class MainWindow(QMainWindow):
 
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
         h, w, _ = rgb.shape
-        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
+        qimg = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format_RGB888)
     
         pixmap = QPixmap.fromImage(qimg)
 
@@ -760,7 +855,7 @@ class MainWindow(QMainWindow):
                     text = (f"Volume: {'%.4f' % volume}mL", QColor(r, g, b))
                 else:
                     voxel = (ann == k).sum()
-                    text = (f"Volume: {'%.4f' % voxel} voxels", QColor(r, g, b))
+                    text = (f"Volume: {voxel} voxels", QColor(r, g, b))
                 texts.append(text)
             self.volume_text_cache = texts
         else:
@@ -774,6 +869,11 @@ class MainWindow(QMainWindow):
 
         self.image_label.setPixmap(pixmap)
         self.image_label.update_scaled_pixmap()
+        if self.show_positive_slices:
+            if not no_ps_update:
+                self.slice_slider.setMarkedIndices(self.positive_slices)
+        else:
+            self.slice_slider.setMarkedIndices([])
 
 
     def update_windowing(self):
@@ -788,11 +888,11 @@ class MainWindow(QMainWindow):
 
     def go_to_previous(self):
         if self.slice_index > 0:
-            self.slider.setValue(self.slice_index - 1)
+            self.slice_slider.setValue(self.slice_index - 1)
 
     def go_to_next(self):
         if self.slice_index < self.slice_count - 1:
-            self.slider.setValue(self.slice_index + 1)
+            self.slice_slider.setValue(self.slice_index + 1)
 
     def tolerance_slider_changed(self, value):
         self.tolerance = value / 100.0  
@@ -814,9 +914,17 @@ class MainWindow(QMainWindow):
         self.update_intensity_range((new_m, new_M))
         self.intensity_slider.setValue((new_m, new_M))  
 
+    def clear_annotation(self):
+        undo_entry = []
+        local_indices = np.argwhere(self.annotation_map > 0)
+        for global_z, global_y, global_x in local_indices:
+            old_val = self.annotation_map[global_z, global_y, global_x]
+            undo_entry.append((global_z, global_y, global_x, old_val))
+            self.annotation_map[global_z, global_y, global_x] = 0
+        self.annotation_history.append(undo_entry)
+        self.update_slice(self.slice_index)
+
     def annotate_pixel_range(self, y, x, direction, drag=False):
-        if drag is False:
-            self.annotation_map_backup = self.annotation_map.copy()
         z = self.slice_index
         R = self.brush_size
 
@@ -833,8 +941,6 @@ class MainWindow(QMainWindow):
             z_min = z - self.propagete_slides
             z_max = z + self.propagete_slides + 1
         
-
-
         y_min = max(0, y - R)
         y_max = min(self.volume_shape[1], y + R + 1)
         x_min = max(0, x - R)
@@ -852,7 +958,6 @@ class MainWindow(QMainWindow):
         circular_mask = np.repeat(circular_mask_slice[None], z_max-z_min, axis=0)
         # Intensity threshold mask
         intensity_mask = (roi >= self.intensity_min) & (roi <= self.intensity_max)
-        print(self.intensity_min, self.intensity_max, np.unique(roi))
         # Final mask: inside circle and within intensity range
         mask = circular_mask & intensity_mask
         mask = keep_largest_component(mask, self.keep_largest_mode, direction=direction)
@@ -864,7 +969,9 @@ class MainWindow(QMainWindow):
             global_z = z_min + dz_
             global_y = y_min + dy_
             global_x = x_min + dx_
-            old_val = self.annotation_map_backup[global_z, global_y, global_x]
+            if self.brain_mask[global_z, global_y, global_x] == 0: continue
+            if not self.overwrite and self.annotation_map[global_z, global_y, global_x] != 0: continue
+            old_val = self.annotation_map[global_z, global_y, global_x]
             undo_entry.append((global_z, global_y, global_x, old_val))
             self.annotation_map[global_z, global_y, global_x] = self.annotation_number
         if drag and len(self.annotation_history) > 0:
@@ -920,7 +1027,7 @@ class MainWindow(QMainWindow):
             z_max = z + self.propagete_slides + 1
 
 
-        line_mask_slice = np.zeros_like(self.volume[0])
+        line_mask_slice = np.ascontiguousarray(np.zeros_like(self.volume[0]), dtype=np.uint8)
         cv2.line(line_mask_slice, (x1, y1), (x2, y2), color=1, thickness=self.brush_size)
         line_mask = np.repeat(line_mask_slice[None], z_max-z_min, axis=0)
 
@@ -934,6 +1041,8 @@ class MainWindow(QMainWindow):
         local_indices = np.argwhere(mask)
         for dz_, global_y, global_x in local_indices:
             global_z = z_min + dz_
+            if self.brain_mask[global_z, global_y, global_x] == 0: continue
+            if not self.overwrite and self.annotation_map[global_z, global_y, global_x] != 0: continue
             old_val = self.annotation_map[global_z, global_y, global_x]
             undo_entry.append((global_z, global_y, global_x, old_val))
             self.annotation_map[global_z, global_y, global_x] = self.annotation_number
@@ -1062,10 +1171,11 @@ class MainWindow(QMainWindow):
             for dy_, dx_ in local_indices:
                 global_y = y_min + dy_
                 global_x = x_min + dx_
+                if self.brain_mask[global_z, global_y, global_x] == 0: continue
+                if not self.overwrite and self.annotation_map[global_z, global_y, global_x] != 0: continue
                 old_val = self.annotation_map[global_z, global_y, global_x]
                 undo_entry.append((global_z, global_y, global_x, old_val))
                 self.annotation_map[global_z, global_y, global_x] = self.annotation_number
-
         self.annotation_history.append(undo_entry)
         self.update_slice(z)
 
@@ -1130,14 +1240,14 @@ class MainWindow(QMainWindow):
             z_min = z
             z_max = z + 1
         elif direction=='left':
-            z_min = z - self.propagete_slides
+            z_min = max(0, z - self.propagete_slides)
             z_max = z + 1  
         elif direction=='right':
             z_min = z
-            z_max = z + self.propagete_slides + 1
+            z_max = min(self.slice_count, z + self.propagete_slides + 1)
         else:
-            z_min = z - self.propagete_slides
-            z_max = z + self.propagete_slides + 1
+            z_min = max(0, z - self.propagete_slides)
+            z_max = min(self.slice_count, z + self.propagete_slides + 1)
 
         # Create mask for voxels to remove:
         # Only those in the connected component AND in slices in [z_min, z_max)
@@ -1163,7 +1273,7 @@ class MainWindow(QMainWindow):
     def undo_annotation(self):
         if self.annotation_history:
             last_action = self.annotation_history.pop()
-            for z, y, x, old_val in last_action:
+            for z, y, x, old_val in last_action[::-1]:
                 self.annotation_map[z, y, x] = old_val
             self.update_slice(self.slice_index)
 
@@ -1174,7 +1284,7 @@ class MainWindow(QMainWindow):
         if self.file_mode == "dicom":
             save_path = QFileDialog.getSaveFileName(self, caption="Save Annotation", filter="Nifti file (*.nii)", directory=os.path.join(self.last_basename, self.nifti_default_save_name))[0]
             if save_path:
-                nib.save(nib.Nifti1Image(np.transpose(anno, (1,2,0)), np.ones((4,4))), save_path)
+                nib.save(nib.Nifti1Image(np.transpose(anno, (1,2,0)).astype(np.int16), np.ones((4,4))), save_path)
         elif self.file_mode == "numpy":
             save_path = QFileDialog.getSaveFileName(self, caption="Save Annotation", filter="Numpy file (*.npy)", directory=os.path.join(self.last_basename, self.numpy_default_save_name))[0]
             if save_path:
@@ -1188,7 +1298,11 @@ class MainWindow(QMainWindow):
         if self.flip_idx:
             anno = np.flip(anno, 0)
         if self.file_mode == "dicom":
-            save_name = os.path.join(self.last_basename, self.nifti_default_save_name)
+            if self.nifti_default_save_name == "":
+                nifti_name = self.nifti_save_name
+            else:
+                nifti_name = self.nifti_default_save_name
+            save_name = os.path.join(self.last_basename, nifti_name)
             nib.save(nib.Nifti1Image(np.transpose(anno, (1,2,0)), np.ones((4,4))), save_name)
         elif self.file_mode == "numpy":
             save_name = os.path.join(self.last_basename, self.numpy_default_save_name)

@@ -45,14 +45,13 @@ class ImageLabel(QLabel):
             event.accept()
 
         else:
-            # Shift + Scroll: change slice
-            current_val = self.parent.slider.value()
-            max_val = self.parent.slider.maximum()
-            min_val = self.parent.slider.minimum()
+            current_val = self.parent.slice_slider.value()
+            max_val = self.parent.slice_slider.maximum()
+            min_val = self.parent.slice_slider.minimum()
             step = -1 if angle_delta > 0 else 1
             new_val = current_val + step
             new_val = max(min_val, min(max_val, new_val))
-            self.parent.slider.setValue(new_val)
+            self.parent.slice_slider.setValue(new_val)
             event.accept()
 
     def mousePressEvent(self, event):

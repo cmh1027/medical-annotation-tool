@@ -3,9 +3,13 @@ from scipy.ndimage import label
 from skimage.measure import regionprops
 import pydicom
 import os
-from glob import glob
 from scipy.ndimage import zoom
 import nibabel as nib
+import warnings
+from pathlib import Path
+from os.path import basename as bn
+from os.path import dirname as dn
+import shutil
 def keep_largest_component(mask, mode, num_components=1, direction=None):
     assert len(mask.shape) == 3
     if mode == "None":
@@ -64,8 +68,7 @@ def read_dicom(dcm_path, rescale=False):
         dcm.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian  # type: ignore
     required_elements = ['PixelData', 'BitsAllocated', 'Rows', 'Columns',
                      'PixelRepresentation', 'SamplesPerPixel','PhotometricInterpretation',
-                        'BitsStored','HighBit']
-    missing = [elem for elem in required_elements if elem not in dcm]
+                        'BitsStored','HighBit', 'RescaleSlope', 'RescaleIntercept']
     for elem in required_elements:
         if elem not in dcm:
             if elem== 'BitsAllocated':
@@ -80,17 +83,23 @@ def read_dicom(dcm_path, rescale=False):
                 dcm.BitsStored = 12
             if elem== 'BitsStored':
                 dcm.BitsStored = 11
+            if elem== 'RescaleSlope':
+                dcm.RescaleSlope = 1
+            if elem== 'RescaleIntercept':
+                dcm.RescaleIntercept = 0
     if rescale: # For CT
         arr = dcm.pixel_array
         arr_hu = (arr * dcm.RescaleSlope + dcm.RescaleIntercept).astype(np.int16)
         dcm.PixelRepresentation = 1
         dcm.PixelData = arr_hu.tobytes()
+        dcm.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
     else:
         if dcm.PixelRepresentation == 1:
             arr = dcm.pixel_array
             overflow_threshold = 1 << (dcm.BitsStored-1)
             arr[arr >= overflow_threshold] = 0
             dcm.PixelData = arr.tobytes()
+            dcm.file_meta.TransferSyntaxUID = pydicom.uid.ImplicitVRLittleEndian
     return dcm
 
 def read_dicoms(dcm_path, 
@@ -99,17 +108,49 @@ def read_dicoms(dcm_path,
                 return_metadata=False,
                 metadata_list=[],
                 rescale=False):
-    dcm_list = sorted(glob(os.path.join(dcm_path, "*.dcm")))
+    dcm_list = sorted(list(filter(lambda k:".dcm" in k.lower(), os.listdir(dcm_path))))
     dcm_array = []
     instance_num = []
     sl_loc = []
     dcm_infos = []
+    instance_uids = []
+    filenames = []
     for sl in range(len(dcm_list)):
-        dcm_info = read_dicom(dcm_list[sl], rescale=rescale)
+        dcm_info = read_dicom(os.path.join(dcm_path,dcm_list[sl]), rescale=rescale)
         dcm_infos.append(dcm_info)
         dcm_array.append(dcm_info.pixel_array)
         instance_num.append(dcm_info.InstanceNumber)
+        instance_uids.append(dcm_info.SeriesInstanceUID)
         sl_loc.append(np.float16(dcm_info.ImagePositionPatient[2]))
+        filenames.append(dcm_list[sl])
+    instance_uids = np.array(instance_uids)
+    values, counts = np.unique(instance_uids, return_counts=True)
+    dominant_uid = values[np.argmax(counts)]
+    if (instance_uids != dominant_uid).sum() > 0:
+        warnings.warn(f"Multiple Series UID has been detected.")
+    for k in np.sort(np.argwhere(instance_uids != dominant_uid).flatten())[::-1]:
+        dcm_array.pop(k)
+        instance_num.pop(k)
+        sl_loc.pop(k)
+        dcm_infos.pop(k)
+        filenames.pop(k)
+
+    if len(set(instance_num)) < len(instance_num):
+        if len(set(instance_num)) == 1:
+            warnings.warn(f"Invalid instance number has been detected : Use z-coordinates instead")
+            instance_num = np.argsort(sl_loc)
+        else:
+            warnings.warn(f"Duplicate instance number has been detected.")
+            seen = set()
+            for k, inum in list(enumerate(instance_num))[::-1]:
+                if inum in seen:
+                    dcm_array.pop(k)
+                    instance_num.pop(k)
+                    sl_loc.pop(k)
+                    dcm_infos.pop(k)
+                    filenames.pop(k)
+                else:
+                    seen.add(inum)
 
     dcm_array  = np.array(dcm_array)
     dcm_array[np.isnan(dcm_array)] = 0
@@ -117,32 +158,30 @@ def read_dicoms(dcm_path,
     dcm_array = np.array(dcm_array)[sort_idx]
     sl_loc = np.array(sl_loc)[sort_idx]
     dcm_infos = np.array(dcm_infos)[sort_idx]
+    filenames = np.array(filenames)[sort_idx]
 
     flip_idx = sl_loc[0] > sl_loc[-1]
     if flip_idx and autoflip:
         dcm_array = np.flip(dcm_array,0)
+        dcm_infos = np.flip(dcm_infos,0)
+        filenames = np.flip(filenames,0)
     
     if not slice_first:
         dcm_array = np.transpose(dcm_array,(1,2,0))
 
     pixel_spacing = dcm_infos[0].PixelSpacing
-    if hasattr(dcm_infos[0],'SpacingBetweenSlices'):
-        slice_spacing = dcm_infos[0].SpacingBetweenSlices
-    else:
-        slice_spacing = abs(dcm_infos[1].ImagePositionPatient[2] - dcm_infos[0].ImagePositionPatient[2])
-    if hasattr(dcm_infos[0], 'SliceThickness'):
-        thickness = dcm_infos[0].SliceThickness
-    else:
-        thickness  = dcm_infos[0].SpacingBetweenSlices
+    slice_spacing = get_slice_spacing([dcm_infos[0], dcm_infos[1]])
+    thickness = get_slice_thickness([dcm_infos[0], dcm_infos[1]])
 
     return_array = dcm_array
 
     if return_metadata:
         metadata = {
-            "pixel_spacing" : (float(pixel_spacing[0]), float(pixel_spacing[1])),
-            "slice_spacing" : float(slice_spacing),
-            "thickness" : float(thickness),
-            "flip_idx": flip_idx
+            "pixel_spacing" : (abs(float(pixel_spacing[0])), abs(float(pixel_spacing[1]))),
+            "slice_spacing" : abs(float(slice_spacing)),
+            "thickness" : abs(float(thickness)),
+            "flip_idx": flip_idx,
+            "filenames": filenames
         }
         for tag in metadata_list:
             L = []
@@ -152,7 +191,6 @@ def read_dicoms(dcm_path,
         return return_array, metadata
     else:
         return return_array 
-
 
 def apply_windowing(image_2d, center, width):
     img = image_2d.astype(np.float32)
@@ -184,3 +222,119 @@ def modify_nifti(input_path, modification_fn=None, new_data=None, output_path=No
     if output_path is not None:
         nib.save(new_nifti_img, output_path)
     return new_nifti_img
+
+def get_magnetic_field_strength(dcm_path):
+    dcm_info = read_dicom(os.path.join(dcm_path, os.listdir(dcm_path)[0]))
+    return float(dcm_info.MagneticFieldStrength)
+
+def get_pixel_spacing(dcm_path):
+    dcm_list = sorted(os.listdir(dcm_path))
+    dcm_info = read_dicom(os.path.join(dcm_path,dcm_list[0]))
+    return [float(dcm_info.PixelSpacing[0]), float(dcm_info.PixelSpacing[1])]
+
+def get_slice_spacing(dcm_path, threshold=0.5, return_both=False):
+    if type(dcm_path) is str:
+        dcm_list = sorted(os.listdir(dcm_path))
+        dcm_info1 = read_dicom(os.path.join(dcm_path,dcm_list[0]))
+        dcm_info2 = read_dicom(os.path.join(dcm_path,dcm_list[1]))
+    else:
+        dcm_info1 = dcm_path[0]
+        dcm_info2 = dcm_path[1]
+    slice_spacing_approx = abs(dcm_info1.ImagePositionPatient[2] - dcm_info2.ImagePositionPatient[2])
+    if hasattr(dcm_info1,'SpacingBetweenSlices'):
+        slice_spacing_field = dcm_info1.SpacingBetweenSlices
+        if abs(slice_spacing_field - slice_spacing_approx) > threshold:
+            slice_spacing = slice_spacing_approx
+        else:
+            slice_spacing = slice_spacing_field
+    else:
+        slice_spacing = slice_spacing_approx
+    if return_both:
+        return float(slice_spacing_field), float(slice_spacing_approx)
+    else:
+        return float(slice_spacing)
+
+def check_slice_spacing(dcm_path, threshold=0.5):
+    if type(dcm_path) is str:
+        dcm_list = sorted(os.listdir(dcm_path))
+        dcm_info1 = read_dicom(os.path.join(dcm_path,dcm_list[0]))
+        dcm_info2 = read_dicom(os.path.join(dcm_path,dcm_list[1]))
+    else:
+        dcm_info1 = dcm_path[0]
+        dcm_info2 = dcm_path[1]
+    dcm_info1 = read_dicom(os.path.join(dcm_path,dcm_list[0]))
+    dcm_info2 = read_dicom(os.path.join(dcm_path,dcm_list[1]))
+    slice_spacing_approx = abs(dcm_info1.ImagePositionPatient[2] - dcm_info2.ImagePositionPatient[2])
+    if hasattr(dcm_info1,'SpacingBetweenSlices'):
+        slice_spacing_field = dcm_info1.SpacingBetweenSlices
+        if abs(slice_spacing_field - slice_spacing_approx) > threshold:
+            return True
+        else:
+            return False
+    else:
+        return False
+
+def get_slice_thickness(dcm_path):
+    if type(dcm_path) is str:
+        dcm_list = sorted(os.listdir(dcm_path))
+        dcm_info1 = read_dicom(os.path.join(dcm_path,dcm_list[0]))
+        dcm_info2 = read_dicom(os.path.join(dcm_path,dcm_list[1]))
+    else:
+        dcm_info1 = dcm_path[0]
+        dcm_info2 = dcm_path[1]
+    if hasattr(dcm_info1, 'SliceThickness'):
+        thickness = dcm_info1.SliceThickness
+    elif hasattr(dcm_info1, 'SpacingBetweenSlices'):
+        thickness  = dcm_info1.SpacingBetweenSlices
+    else:
+        thickness = get_slice_spacing(dcm_path)
+    return float(thickness)
+
+def is_reversed(dcm_path, strict=False):
+    dcm_list = sorted(os.listdir(dcm_path))
+    if strict:
+        instance_num = []
+        sl_loc = []
+        for sl in range(len(dcm_list)):
+            dcm_info = read_dicom(os.path.join(dcm_path,dcm_list[sl]))
+            instance_num.append(dcm_info.InstanceNumber)
+            sl_loc.append(np.float16(dcm_info.ImagePositionPatient[2]))
+
+        sort_idx = np.argsort(instance_num)
+        sl_loc = np.array(sl_loc)[sort_idx]
+
+        return sl_loc[0] > sl_loc[-1]
+    else:
+        dcm_path1 = os.path.join(dcm_path, dcm_list[0])
+        dcm_path2 = os.path.join(dcm_path, dcm_list[-1])
+        return read_dicom(dcm_path1).ImagePositionPatient[2] > read_dicom(dcm_path2).ImagePositionPatient[2]
+    
+
+def find_dcm_path(root):
+    root, _, file_list = list(os.walk(root))[-1]
+    return root, sorted(file_list)
+
+def find_all_dcm_path(root):
+    return list(set(list(map(os.path.dirname, Path(root).rglob('*.dcm'))))) + list(set(list(map(os.path.dirname, Path(root).rglob('*.DCM')))))
+
+
+
+def arrange_aiscan(root, remove_duplicate=False):
+    t = find_all_dcm_path(root)
+    temp_root = os.path.join(dn(root), bn(root + "_temp"))
+    for path in t:
+        patient_id = bn(dn(dn(dn(path))))
+        dst = os.path.join(temp_root, patient_id)
+        if not os.path.exists(dst):
+            shutil.move(path, dst)
+        else:
+            if remove_duplicate:
+                shutil.rmtree(path)
+            else:
+                suffix = 2
+                while os.path.exists(os.path.join(temp_root, patient_id+ f"_{suffix}")):
+                    suffix += 1
+                dst = os.path.join(temp_root, patient_id+ f"_{suffix}")
+                shutil.move(path, dst)
+    shutil.rmtree(root)
+    shutil.move(temp_root, root)

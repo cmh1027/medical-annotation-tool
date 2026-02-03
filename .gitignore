@@ -4,3 +4,4 @@
 !/asset/**
 !/modules/**
 modules/**/__pycache__/
+*.ipynb

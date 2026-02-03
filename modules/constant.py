@@ -20,7 +20,7 @@ class ColorPalette(list):
     
     def __getitem__(self, index):
         if index < len(self._annotation_palette):
-            return self._annotation_palette[index]
+            return self._annotation_palette[int(index)]
         else:
             if not self.warning:
                 try:
