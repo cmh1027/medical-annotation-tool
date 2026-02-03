@@ -3,5 +3,7 @@
 !/modules/
 !/asset/**
 !/modules/**
+!/script.py
+!/main.py
 modules/**/__pycache__/
 *.ipynb
